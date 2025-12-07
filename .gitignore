@@ -1,0 +1,39 @@
+# Binaries
+build/bin/
+*/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Wails
+wailsjs/
+frontend/dist/
+frontend/node_modules/
+
+# Go
+go.sum
+vendor/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Config
+config.json
+followed.json
+
+# Ignored Folders
+Downloads/
+pikpak/
+PikPakAPI/
