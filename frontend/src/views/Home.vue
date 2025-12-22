@@ -78,11 +78,12 @@
 
               <!-- 剧集列表预览 -->
               <div>
-                <h3 class="text-lg font-bold text-white mb-3">剧集列表 <span class="text-xs font-normal text-gray-500 ml-2">(左键: 播放本地/下载，右键: 标记观看)</span></h3>
+                <h3 class="text-lg font-bold text-white mb-3">剧集列表 <span class="text-xs font-normal text-gray-500 ml-2">(左键: 播放/下载，右键: 标记观看，中键: 删除)</span></h3>
                 <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2 max-h-40 overflow-y-auto pr-2">
                   <div v-for="ep in detailData.episodes" :key="ep.id" 
                        @click="handleEpisodeClick(ep, $event)"
                        @contextmenu.prevent="toggleWatched(ep)"
+                       @mousedown.middle.prevent="handleEpisodeDelete(ep)"
                        class="px-2 py-1.5 rounded text-center text-xs truncate cursor-pointer transition-colors border border-transparent relative"
                        :class="getEpisodeClass(ep)"
                        :title="ep.name_cn || ep.name"
@@ -99,12 +100,76 @@
         </div>
       </div>
     </div>
+
+    <!-- 磁力选择弹窗 -->
+    <div v-if="showMagnetPicker" class="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50" @click.self="showMagnetPicker = false">
+      <div class="bg-gray-900 rounded-xl shadow-2xl max-w-4xl w-full max-h-[80vh] overflow-hidden border border-gray-700">
+        <div class="p-6 border-b border-gray-700">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-xl font-bold text-white">选择磁力链接 - 第 {{ magnetPickerEp?.sort }} 集</h2>
+            <button @click="showMagnetPicker = false" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+          </div>
+          
+          <!-- 搜索关键词输入 -->
+          <div class="flex gap-2">
+            <input 
+              v-model="magnetSearchKeyword" 
+              @keyup.enter="searchMagnetList"
+              class="flex-1 bg-gray-800 border border-gray-700 rounded px-4 py-2 text-white focus:border-pink-500 focus:outline-none"
+              placeholder="输入关键词搜索（留空使用默认）"
+            />
+            <button 
+              @click="searchMagnetList" 
+              :disabled="magnetSearching"
+              class="bg-pink-600 hover:bg-pink-700 disabled:bg-gray-600 text-white px-6 py-2 rounded font-bold transition"
+            >
+              {{ magnetSearching ? '搜索中...' : '🔍 搜索' }}
+            </button>
+          </div>
+        </div>
+
+        <!-- 候选列表 -->
+        <div class="p-6 overflow-y-auto max-h-[calc(80vh-200px)]">
+          <div v-if="magnetSearching" class="text-center py-8 text-gray-400">
+            <div class="animate-spin inline-block w-8 h-8 border-4 border-pink-500 border-t-transparent rounded-full mb-2"></div>
+            <p>正在搜索...</p>
+          </div>
+
+          <div v-else-if="magnetCandidates.length === 0" class="text-center py-8 text-gray-400">
+            暂无结果，请尝试修改关键词
+          </div>
+
+          <div v-else class="space-y-2">
+            <div 
+              v-for="(item, index) in magnetCandidates" 
+              :key="index"
+              @click="selectMagnet(item)"
+              class="bg-gray-800 hover:bg-gray-750 border border-gray-700 hover:border-pink-500 rounded-lg p-4 cursor-pointer transition-all"
+            >
+              <div class="flex items-start justify-between">
+                <div class="flex-1 min-w-0">
+                  <h3 class="text-white font-medium mb-2 break-words">{{ item.title }}</h3>
+                  <div class="flex flex-wrap gap-3 text-xs text-gray-400">
+                    <span>📦 {{ item.size }}</span>
+                    <span>👤 {{ item.source }}</span>
+                    <span>📅 {{ item.publish_date }}</span>
+                  </div>
+                </div>
+                <button class="ml-4 bg-pink-600 hover:bg-pink-700 text-white px-4 py-2 rounded text-sm font-bold flex-shrink-0">
+                  选择
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted } from 'vue';
-import { GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, PlayMagnet, DownloadEpisode, PlayLocalEpisode } from '../../wailsjs/go/main/App';
+import { GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, PlayMagnet, DownloadEpisode, PlayLocalEpisode, DeleteEpisodeData, SearchEpisodeMagnetList, SaveEpisodeMagnet } from '../../wailsjs/go/main/App';
 
 const collection = ref([]);
 const loading = ref(true);
@@ -114,6 +179,13 @@ const selectedItem = ref(null);
 const detailLoading = ref(false);
 const detailData = ref(null);
 const detailError = ref('');
+
+// 磁力选择弹窗相关
+const showMagnetPicker = ref(false);
+const magnetPickerEp = ref(null);
+const magnetSearchKeyword = ref('');
+const magnetSearching = ref(false);
+const magnetCandidates = ref([]);
 
 const showDetail = async (item) => {
   selectedItem.value = item;
@@ -221,16 +293,98 @@ const handleEpisodeClick = async (ep, event) => {
         return;
     }
     
-    // 2. 如果未下载，则开始下载
-    const magnet = await getMagnet(ep);
-    if (magnet) {
-         const res = await DownloadEpisode(detailData.value.subject.id, ep.sort, magnet);
-         if (res === "Started") {
-             alert("已开始下载，请留意通知");
-         } else {
-             alert(res);
-         }
+    // 2. 如果未下载，打开磁力选择弹窗
+    magnetPickerEp.value = ep;
+    magnetSearchKeyword.value = '';
+    showMagnetPicker.value = true;
+    await searchMagnetList();
+};
+
+const searchMagnetList = async () => {
+  if (!detailData.value || !magnetPickerEp.value) return;
+  
+  magnetSearching.value = true;
+  magnetCandidates.value = [];
+  
+  try {
+    const res = await SearchEpisodeMagnetList(
+      detailData.value.subject.id, 
+      magnetPickerEp.value.sort, 
+      magnetSearchKeyword.value
+    );
+    magnetCandidates.value = res || [];
+  } catch (e) {
+    alert("搜索失败: " + e);
+  } finally {
+    magnetSearching.value = false;
+  }
+};
+
+const selectMagnet = async (item) => {
+  if (!detailData.value || !magnetPickerEp.value) return;
+  
+  // 保存磁力到本地
+  try {
+    await SaveEpisodeMagnet(detailData.value.subject.id, magnetPickerEp.value.sort, item.magnet);
+    
+    // 更新 UI
+    const epKey = magnetPickerEp.value.sort.toString();
+    if (!detailData.value.episode_magnets) {
+      detailData.value.episode_magnets = {};
     }
+    detailData.value.episode_magnets[epKey] = item.magnet;
+    
+    // 开始下载
+    const res = await DownloadEpisode(detailData.value.subject.id, magnetPickerEp.value.sort, item.magnet);
+    if (res === "Started") {
+      alert("已开始下载: " + item.title);
+      showMagnetPicker.value = false;
+    } else {
+      alert(res);
+    }
+  } catch (e) {
+    alert("操作失败: " + e);
+  }
+};
+
+const handleEpisodeDelete = async (ep) => {
+  if (!detailData.value) return;
+  
+  const epKey = ep.sort.toString();
+  const hasMagnet = detailData.value.episode_magnets && detailData.value.episode_magnets[epKey];
+  const hasLocal = detailData.value.downloaded_eps && detailData.value.downloaded_eps.includes(ep.sort);
+  
+  if (!hasMagnet && !hasLocal) {
+    alert("该集没有磁力链接或本地文件");
+    return;
+  }
+  
+  // 构建删除选项提示
+  let options = [];
+  if (hasMagnet) options.push("磁力链接");
+  if (hasLocal) options.push("本地视频");
+  
+  const confirmMsg = `删除第 ${ep.sort} 集的:\n\n${options.join(" + ")}\n\n确定删除吗？`;
+  
+  if (!confirm(confirmMsg)) return;
+  
+  try {
+    const res = await DeleteEpisodeData(detailData.value.subject.id, ep.sort);
+    if (res === "Success") {
+      // 更新本地状态
+      if (hasMagnet && detailData.value.episode_magnets) {
+        delete detailData.value.episode_magnets[epKey];
+      }
+      if (hasLocal && detailData.value.downloaded_eps) {
+        detailData.value.downloaded_eps = detailData.value.downloaded_eps.filter(s => s !== ep.sort);
+      }
+      alert("✅ 删除成功");
+    } else {
+      alert(res);
+    }
+  } catch (e) {
+    alert("删除失败: " + e);
+  }
 };
 
 const fetchCollection = async () => {

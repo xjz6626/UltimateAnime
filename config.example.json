@@ -1,0 +1,20 @@
+{
+  "global_settings": {
+    "bangumi_api_token": "",
+    "bangumi_user_id": "",
+    "pikpak_users": [
+      "your_email@example.com"
+    ],
+    "pikpak_password": "your_password",
+    "auto_login": true,
+    "proxy": "",
+    "torrent_api_url": "https://api.animes.garden/resources"
+  },
+  "local_storage": {
+    "anime_dir": "Downloads"
+  },
+  "player": {
+    "mpv_path": "",
+    "mpv_args": ""
+  }
+}

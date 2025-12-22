@@ -19,7 +19,9 @@ func NewClient(token, proxy string) *BangumiClient {
 	const userAgent = "xjz6626/bangmi-anime-tracker (https://github.com/xjz6626/bangmi)"
 
 	client := resty.New().
-		SetTimeout(10*time.Second).
+		SetTimeout(30*time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(2*time.Second).
 		SetHeader("User-Agent", userAgent). // 关键：设置 UA 防止被风控
 		SetHeader("Accept", "application/json")
 

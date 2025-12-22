@@ -297,3 +297,70 @@ func (c *Crawler) SearchEpisode(keywords []string, episodeNum float64) (*Torrent
 		Source:      bestRes.Publisher.Name,
 	}, nil
 }
+
+// SearchEpisodeList 搜索集数磁力链接，返回所有候选列表（不自动选择）
+func (c *Crawler) SearchEpisodeList(keywords []string, episodeNum float64) ([]TorrentItem, error) {
+	var respData SearchResp
+
+	// 1. 发送搜索请求
+	var searchTerms []string
+	if len(keywords) > 0 {
+		searchTerms = append(searchTerms, keywords[0])
+	}
+
+	// 添加集数
+	if episodeNum == float64(int(episodeNum)) {
+		searchTerms = append(searchTerms, fmt.Sprintf("%02d", int(episodeNum)))
+	} else {
+		searchTerms = append(searchTerms, fmt.Sprintf("%g", episodeNum))
+	}
+
+	searchParamBytes, _ := json.Marshal(searchTerms)
+	searchParam := string(searchParamBytes)
+
+	fmt.Printf("🔍 [Crawler] Searching List: %s, Target Ep: %.1f\n", searchParam, episodeNum)
+
+	_, err := c.client.R().
+		SetQueryParams(map[string]string{
+			"search":   searchParam,
+			"pageSize": "100",
+			"page":     "1",
+		}).
+		SetResult(&respData).
+		Get(c.ApiUrl)
+
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %v", err)
+	}
+
+	fmt.Printf("🔍 [Crawler] Found %d items\n", len(respData.Resources))
+
+	// 2. 筛选特定集数并转换为 TorrentItem
+	var results []TorrentItem
+	for _, res := range respData.Resources {
+		ep := ParseEpisodeNumber(res.Title)
+
+		// 使用 epsilon 比较浮点数
+		if math.Abs(ep-episodeNum) < 0.1 {
+			pubDate := res.CreatedAt
+			if t, err := time.Parse(time.RFC3339, res.CreatedAt); err == nil {
+				pubDate = t.Format("2006-01-02 15:04")
+			}
+
+			results = append(results, TorrentItem{
+				Title:       res.Title,
+				Magnet:      res.Magnet,
+				Size:        parseSize(res.Size),
+				PublishDate: pubDate,
+				Source:      res.Publisher.Name,
+			})
+		}
+	}
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("episode %.1f not found", episodeNum)
+	}
+
+	fmt.Printf("  ✅ Found %d candidates\n", len(results))
+	return results, nil
+}

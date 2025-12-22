@@ -40,8 +40,9 @@ func NewApp() *App {
 	// 2. 初始化 Bangumi 客户端
 	// 从配置中读取 Token (复刻 bangumi_api.py 的逻辑)
 	bgmToken := cfgMgr.Data.GlobalSettings.BangumiApiToken
-	proxy := cfgMgr.Data.GlobalSettings.Proxy
-	bgmClient := bangumi.NewClient(bgmToken, proxy)
+	// proxy := cfgMgr.Data.GlobalSettings.Proxy
+	// 用户反馈 Bangumi API 走代理可能超时，强制不使用代理
+	bgmClient := bangumi.NewClient(bgmToken, "")
 
 	// 3. 初始化资源爬虫 (复刻 search_torrents.py 的逻辑)
 	// 从配置中读取 torrent_api_url (默认 api.animes.garden)
@@ -442,6 +443,69 @@ func (a *App) SearchEpisodeMagnet(subjectID int, epSort float64) string {
 	return res.Magnet
 }
 
+// SearchEpisodeMagnetList 搜索集数磁力链接，返回候选列表
+func (a *App) SearchEpisodeMagnetList(subjectID int, epSort float64, customKeywords string) ([]crawler.TorrentItem, error) {
+	a.Log("INFO", fmt.Sprintf("搜索磁力列表: ID=%d, Ep=%v, Keywords=%s", subjectID, epSort, customKeywords))
+
+	// 1. 构造搜索关键词
+	var keywords []string
+	if customKeywords != "" {
+		// 使用自定义关键词
+		keywords = []string{customKeywords}
+	} else {
+		// 使用默认关键词
+		list := a.GetLocalFollows()
+		for _, v := range list {
+			if v.SubjectID == subjectID {
+				if v.NameCN != "" {
+					keywords = append(keywords, v.NameCN)
+				} else {
+					keywords = append(keywords, v.Name)
+				}
+				break
+			}
+		}
+		if len(keywords) == 0 {
+			return nil, fmt.Errorf("未找到追番记录")
+		}
+	}
+
+	// 2. 调用爬虫获取候选列表
+	return a.crawler.SearchEpisodeList(keywords, epSort)
+}
+
+// SaveEpisodeMagnet 手动保存选定的磁力链接
+func (a *App) SaveEpisodeMagnet(subjectID int, epSort float64, magnet string) string {
+	a.Log("INFO", fmt.Sprintf("保存磁力: ID=%d, Ep=%v", subjectID, epSort))
+
+	list := a.GetLocalFollows()
+	var targetItem *FollowedItem
+	var targetIndex int
+
+	for i, v := range list {
+		if v.SubjectID == subjectID {
+			targetItem = &list[i]
+			targetIndex = i
+			break
+		}
+	}
+
+	if targetItem == nil {
+		return "Error: 请先追番"
+	}
+
+	// 保存磁力链接
+	epKey := fmt.Sprintf("%v", epSort)
+	if targetItem.EpisodeMagnets == nil {
+		targetItem.EpisodeMagnets = make(map[string]string)
+	}
+	targetItem.EpisodeMagnets[epKey] = magnet
+
+	// 更新列表
+	list[targetIndex] = *targetItem
+	return a.saveFollowedList(list)
+}
+
 // UnfollowLocal 取消本地追番
 func (a *App) UnfollowLocal(subjectID int) string {
 	a.Log("INFO", fmt.Sprintf("取消本地追番: %d", subjectID))
@@ -591,14 +655,41 @@ func (a *App) getPikPakFileFromMagnet(magnet string) (string, string, int64, err
 			break
 		}
 
-		// 检查是否为限额错误 (api error 11)
+		// 检查是否为限额错误 (api error 11) 或 空间不足 (api error 8)
 		errMsg := err.Error()
-		if strings.Contains(errMsg, "task_daily_create_limit") || strings.Contains(errMsg, "api error 11") {
-			a.Log("WARN", fmt.Sprintf("当前账号配额已满 (%v)，尝试切换账号...", err))
+		if strings.Contains(errMsg, "task_daily_create_limit") || strings.Contains(errMsg, "api error 11") ||
+			strings.Contains(errMsg, "file_space_not_enough") || strings.Contains(errMsg, "api error 8") {
+
+			reason := "每日配额已满"
+			if strings.Contains(errMsg, "file_space_not_enough") || strings.Contains(errMsg, "api error 8") {
+				reason = "云盘空间不足"
+				// 空间不足时，异步清理当前账号空间，并立即切换账号
+				a.Log("WARN", "当前账号空间不足，启动后台彻底清理（永久删除所有文件）...")
+
+				// 捕获当前客户端实例和账号名，用于后台清理
+				currentClient := a.pikpakClient
+				currentUsername := ""
+				if currentClient != nil {
+					currentUsername = currentClient.Username
+				}
+
+				go func(client *pikpak.PikPakClient, username string) {
+					if client != nil {
+						a.Log("INFO", fmt.Sprintf("🧹 [后台清理] 开始清空账号 %s 的云盘空间...", username))
+						if clearErr := client.ClearStorage(); clearErr != nil {
+							a.Log("ERROR", fmt.Sprintf("❌ [后台清理] 账号 %s 清理失败: %v", username, clearErr))
+						} else {
+							a.Log("SUCCESS", fmt.Sprintf("✅ [后台清理] 账号 %s 空间清理完成，所有文件已永久删除", username))
+						}
+					}
+				}(currentClient, currentUsername)
+			}
+
+			a.Log("WARN", fmt.Sprintf("当前账号不可用 (%s)，尝试切换账号...", reason))
 
 			// 标记当前账号今日不可用
 			if a.pikpakClient != nil {
-				a.markAccountBlocked(a.pikpakClient.Username, "每日配额已满")
+				a.markAccountBlocked(a.pikpakClient.Username, reason)
 			}
 
 			if switchErr := a.switchToNextAccount(); switchErr != nil {
@@ -1136,4 +1227,122 @@ func (a *App) removeEpisodeRecord(subjectID int, epSort float64) {
 			break
 		}
 	}
+}
+
+// DeleteEpisodeData 删除集数的磁力链接和/或本地文件
+func (a *App) DeleteEpisodeData(subjectID int, epSort float64) string {
+	a.Log("INFO", fmt.Sprintf("删除集数数据: ID=%d, Ep=%v", subjectID, epSort))
+
+	list := a.GetLocalFollows()
+	var targetItem *FollowedItem
+	var targetIndex int
+
+	for i, v := range list {
+		if v.SubjectID == subjectID {
+			targetItem = &list[i]
+			targetIndex = i
+			break
+		}
+	}
+
+	if targetItem == nil {
+		return "Error: 未找到追番记录"
+	}
+
+	epKey := fmt.Sprintf("%v", epSort)
+	deleted := false
+
+	// 1. 删除本地文件
+	if targetItem.LocalFiles != nil {
+		if filePath, ok := targetItem.LocalFiles[epKey]; ok && filePath != "" {
+			if err := os.Remove(filePath); err != nil {
+				a.Log("WARN", fmt.Sprintf("删除本地文件失败: %v", err))
+			} else {
+				a.Log("INFO", fmt.Sprintf("✅ 已删除本地文件: %s", filePath))
+				deleted = true
+			}
+			delete(targetItem.LocalFiles, epKey)
+		}
+	}
+
+	// 2. 删除磁力链接记录
+	if targetItem.EpisodeMagnets != nil {
+		if _, ok := targetItem.EpisodeMagnets[epKey]; ok {
+			delete(targetItem.EpisodeMagnets, epKey)
+			a.Log("INFO", "✅ 已删除磁力链接记录")
+			deleted = true
+		}
+	}
+
+	// 3. 移除下载标记
+	newDownloadedEps := []float64{}
+	for _, e := range targetItem.DownloadedEps {
+		if e != epSort {
+			newDownloadedEps = append(newDownloadedEps, e)
+		}
+	}
+	targetItem.DownloadedEps = newDownloadedEps
+
+	// 保存更新
+	list[targetIndex] = *targetItem
+	if res := a.saveFollowedList(list); res != "Success" {
+		return res
+	}
+
+	if !deleted {
+		return "Error: 未找到可删除的数据"
+	}
+
+	return "Success"
+}
+
+// ClearPikPakStorage 手动清空指定 PikPak 账号的云盘空间
+// username: 要清空的账号，如果为空则清空当前登录账号
+func (a *App) ClearPikPakStorage(username string) string {
+	// 如果指定了账号，需要先登录
+	if username != "" && (a.pikpakClient == nil || a.pikpakClient.Username != username) {
+		password := a.configMgr.Data.GlobalSettings.PikPakPassword
+		if password == "" {
+			return "Error: 未配置密码"
+		}
+
+		a.Log("INFO", fmt.Sprintf("🔐 切换到账号 %s 进行清空操作...", username))
+		proxy := a.configMgr.Data.GlobalSettings.Proxy
+		client := pikpak.NewPikPakClient(username, password, proxy)
+
+		if err := client.Login(); err != nil {
+			return fmt.Sprintf("Error: 登录失败 %v", err)
+		}
+
+		// 临时使用这个客户端进行清空
+		a.Log("INFO", fmt.Sprintf("🧹 开始清空账号 %s 的云盘空间...", username))
+		go func(c *pikpak.PikPakClient, user string) {
+			if err := c.ClearStorage(); err != nil {
+				a.Log("ERROR", fmt.Sprintf("❌ 账号 %s 清空失败: %v", user, err))
+			} else {
+				a.Log("SUCCESS", fmt.Sprintf("✅ 账号 %s 的云盘空间已清空（所有文件已永久删除）", user))
+			}
+		}(client, username)
+
+		return "Started"
+	}
+
+	// 清空当前账号
+	if a.pikpakClient == nil {
+		return "Error: 请先登录 PikPak"
+	}
+
+	currentUsername := a.pikpakClient.Username
+	a.Log("INFO", fmt.Sprintf("🧹 开始清空账号 %s 的云盘空间...", currentUsername))
+
+	// 异步执行清理，避免阻塞前端
+	go func() {
+		if err := a.pikpakClient.ClearStorage(); err != nil {
+			a.Log("ERROR", fmt.Sprintf("❌ 清空失败: %v", err))
+		} else {
+			a.Log("SUCCESS", fmt.Sprintf("✅ 账号 %s 的云盘空间已清空（所有文件已永久删除）", currentUsername))
+		}
+	}()
+
+	return "Started"
 }

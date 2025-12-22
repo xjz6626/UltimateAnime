@@ -29,11 +29,7 @@ Thumbs.db
 # Logs
 *.log
 
-# Config
+# User Data & Config
 config.json
 followed.json
-
-# Ignored Folders
 Downloads/
-pikpak/
-PikPakAPI/

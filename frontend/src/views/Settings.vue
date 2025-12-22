@@ -25,6 +25,18 @@
                 {{ isBlocked(user) ? '🚫 已封禁' : '✅ 正常' }}
               </button>
 
+              <!-- 清空云盘按钮 -->
+              <button 
+                v-if="user"
+                @click="clearStorageForUser(user)" 
+                :disabled="clearingAccounts[user]"
+                class="px-3 py-2.5 rounded transition text-sm font-bold whitespace-nowrap bg-orange-900/30 text-orange-400 hover:bg-orange-900/50 disabled:bg-gray-600 disabled:text-gray-400"
+                title="清空该账号的云盘空间"
+              >
+                <span v-if="clearingAccounts[user]" class="animate-spin">⏳</span>
+                <span v-else>🗑️ 清空</span>
+              </button>
+
               <button @click="removeUser(index)" class="px-3 bg-red-900/50 text-red-400 rounded hover:bg-red-900 hover:text-white transition h-[42px]">🗑️</button>
             </div>
             <button @click="addUser" class="text-sm text-pink-400 hover:text-pink-300 flex items-center mt-2">
@@ -44,6 +56,8 @@
                 <label class="toggle-label block overflow-hidden h-6 rounded-full bg-gray-700 cursor-pointer" :class="{'bg-pink-900': config.global_settings.auto_login}"></label>
             </div>
           </div>
+
+          <!-- 去掉原来的手动清空云盘按钮区域 -->
         </div>
       </div>
 
@@ -97,9 +111,10 @@
 
 <script setup>
 import { ref, onMounted } from 'vue';
-import { GetAppConfig, SaveAppConfig, GetBlockedAccounts, SetAccountBlockStatus } from '../../wailsjs/go/main/App';
+import { GetAppConfig, SaveAppConfig, GetBlockedAccounts, SetAccountBlockStatus, ClearPikPakStorage } from '../../wailsjs/go/main/App';
 
 const saving = ref(false);
+const clearingAccounts = ref({});
 const config = ref({
   global_settings: { pikpak_users: [''], pikpak_password: '', proxy: '', auto_login: false },
   local_storage: { anime_dir: '' },
@@ -164,6 +179,34 @@ const removeUser = (index) => {
   }
 };
 
+const clearStorageForUser = async (username) => {
+  if (!username || username.trim() === '') {
+    alert("请先输入账号");
+    return;
+  }
+  
+  if (!confirm(`⚠️ 确定要清空账号 ${username} 的云盘吗？\n\n此操作将永久删除该账号的所有文件，无法恢复！`)) {
+    return;
+  }
+  
+  clearingAccounts.value[username] = true;
+  try {
+    const res = await ClearPikPakStorage(username);
+    if (res === "Started") {
+      alert(`✅ 账号 ${username} 的清空任务已启动！\n\n请在日志页面查看清理进度。`);
+    } else if (res.startsWith("Error:")) {
+      alert("❌ " + res);
+    }
+  } catch (err) {
+    alert("操作失败: " + err);
+  } finally {
+    // 延迟 2 秒再恢复按钮，防止误点
+    setTimeout(() => {
+      clearingAccounts.value[username] = false;
+    }, 2000);
+  }
+};
+
 const saveConfig = async () => {
   saving.value = true;
   try {
@@ -180,6 +223,29 @@ const saveConfig = async () => {
     saving.value = false;
   }
 };
+const clearStorage = async () => {
+  if (!confirm("⚠️ 确定要清空云盘吗？\n\n此操作将永久删除当前账号的所有文件，无法恢复！")) {
+    return;
+  }
+  
+  clearing.value = true;
+  try {
+    const res = await ClearPikPakStorage();
+    if (res === "Started") {
+      alert("✅ 清空任务已启动！\n\n请在日志页面查看清理进度。");
+    } else if (res.startsWith("Error:")) {
+      alert("❌ " + res);
+    }
+  } catch (err) {
+    alert("操作失败: " + err);
+  } finally {
+    // 延迟 2 秒再恢复按钮，防止误点
+    setTimeout(() => {
+      clearing.value = false;
+    }, 2000);
+  }
+};
+
 
 onMounted(() => {
   loadConfig();
