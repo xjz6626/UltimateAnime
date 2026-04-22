@@ -32,6 +32,58 @@ type App struct {
 	blockedAccounts     map[string]string   // 账号封禁状态 map[username]date (YYYY-MM-DD)
 }
 
+var windowsPathReplacer = strings.NewReplacer(
+	"<", "_",
+	">", "_",
+	":", "_",
+	"\"", "_",
+	"/", "_",
+	"\\", "_",
+	"|", "_",
+	"?", "_",
+	"*", "_",
+)
+
+var windowsReservedNames = map[string]struct{}{
+	"CON":  {},
+	"PRN":  {},
+	"AUX":  {},
+	"NUL":  {},
+	"COM1": {},
+	"COM2": {},
+	"COM3": {},
+	"COM4": {},
+	"COM5": {},
+	"COM6": {},
+	"COM7": {},
+	"COM8": {},
+	"COM9": {},
+	"LPT1": {},
+	"LPT2": {},
+	"LPT3": {},
+	"LPT4": {},
+	"LPT5": {},
+	"LPT6": {},
+	"LPT7": {},
+	"LPT8": {},
+	"LPT9": {},
+}
+
+func sanitizePathSegment(name string) string {
+	cleaned := strings.TrimSpace(name)
+	cleaned = windowsPathReplacer.Replace(cleaned)
+	cleaned = strings.TrimRight(cleaned, ". ")
+	if cleaned == "" {
+		return "unnamed"
+	}
+
+	if _, isReserved := windowsReservedNames[strings.ToUpper(cleaned)]; isReserved {
+		cleaned = "_" + cleaned
+	}
+
+	return cleaned
+}
+
 // NewApp creates a new App application struct
 func NewApp() *App {
 	// 1. 初始化配置管理器 (自动读取 config.json)
@@ -842,10 +894,7 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 				break
 			}
 		}
-		// 替换非法字符
-		animeName = strings.ReplaceAll(animeName, ":", "_")
-		animeName = strings.ReplaceAll(animeName, "/", "_")
-		animeName = strings.ReplaceAll(animeName, "\\", "_")
+		animeName = sanitizePathSegment(animeName)
 
 		cwd, _ := os.Getwd()
 		downloadDir := filepath.Join(cwd, "Downloads", animeName)
@@ -854,7 +903,8 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 			return
 		}
 
-		savePath := filepath.Join(downloadDir, fileName)
+		safeFileName := sanitizePathSegment(fileName)
+		savePath := filepath.Join(downloadDir, safeFileName)
 		a.Log("INFO", fmt.Sprintf("开始下载到: %s", savePath))
 
 		// 3. 开始下载
