@@ -911,6 +911,7 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 		var lastTime = time.Now()
 		var lastBytes int64 = 0
 		var speed int64 = 0
+		lastProgressLogTime := time.Now().Add(-10 * time.Second)
 
 		err = a.pikpakClient.DownloadFileConcurrent(fileID, savePath, fileSize, 16, func(current, total int64) {
 			now := time.Now()
@@ -929,6 +930,13 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 				// 打印进度到控制台
 				fmt.Printf("\r⬇️ [下载中] 进度: %.2f%% | 速度: %s/s | 已下载: %s | 总大小: %s   ",
 					progressVal, formatBytes(speed), formatBytes(current), formatBytes(total))
+
+				// 打包版通常看不到控制台输出，这里节流写入应用日志。
+				if now.Sub(lastProgressLogTime) >= 5*time.Second || current == total {
+					a.Log("INFO", fmt.Sprintf("下载进度: %.2f%% | 速度: %s/s | 已下载: %s/%s",
+						progressVal, formatBytes(speed), formatBytes(current), formatBytes(total)))
+					lastProgressLogTime = now
+				}
 
 				if a.ctx != nil {
 					runtime.EventsEmit(a.ctx, "download-progress", map[string]interface{}{
