@@ -24,7 +24,11 @@ func main() {
 			Assets: assets,
 		},
 		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
-		OnStartup:        app.startup,
+		// 👇 加这两段
+		Debug: options.Debug{
+			OpenInspectorOnStartup: true, // 启动时自动打开 DevTools
+		},
+		OnStartup: app.startup,
 		Bind: []interface{}{
 			app,
 		},

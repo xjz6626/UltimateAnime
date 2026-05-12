@@ -6,6 +6,7 @@ build/bin/
 *.dll
 *.so
 *.dylib
+*.zip
 
 # Wails
 wailsjs/
@@ -29,7 +30,10 @@ Thumbs.db
 # Logs
 *.log
 
+
+
 # User Data & Config
 config.json
 followed.json
 Downloads/
+cache/

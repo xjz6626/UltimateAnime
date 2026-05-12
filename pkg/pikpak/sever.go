@@ -8,7 +8,16 @@ import (
 	"strings"
 )
 
-// StartServer 启动本地流式代理服务器
+// RegisterStreamHandler 把 /stream 流式代理注册到指定 mux 上
+// 与图片代理共用端口（54321），由 imgproxy 启动监听
+func (d *PikPakClient) RegisterStreamHandler(mux *http.ServeMux) {
+	mux.HandleFunc("/stream", d.handleStream)
+	fmt.Println("🚀 [PikPak] /stream 流式代理已注册")
+}
+
+// StartServer 保留旧接口以兼容（独立启动，自带 mux）
+// 注意：如果 imgproxy 已经在用 54321 端口，调用此函数会失败
+// 推荐用 RegisterStreamHandler 把 handler 挂到 imgproxy 的 mux 上
 var serverStarted bool
 
 func (d *PikPakClient) StartServer(port string) {
@@ -17,14 +26,14 @@ func (d *PikPakClient) StartServer(port string) {
 		return
 	}
 
-	http.HandleFunc("/stream", d.handleStream)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", d.handleStream)
 
 	fmt.Printf("🚀 流式代理服务已启动: http://127.0.0.1:%s\n", port)
 	serverStarted = true
 
-	// 建议在 goroutine 中运行，或者由 main 决定
 	go func() {
-		if err := http.ListenAndServe(":"+port, nil); err != nil {
+		if err := http.ListenAndServe(":"+port, mux); err != nil {
 			fmt.Printf("❌ 代理服务启动失败: %v\n", err)
 		}
 	}()
@@ -52,7 +61,12 @@ func (d *PikPakClient) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf("🔗 [Proxy] 获取直链成功: %s...\n", downloadLink[:50]) // 只打印前50字符避免刷屏
+	// 安全打印：直链可能短于 50 字符（极端情况），切片要做边界检查
+	preview := downloadLink
+	if len(preview) > 50 {
+		preview = preview[:50] + "..."
+	}
+	fmt.Printf("🔗 [Proxy] 获取直链成功: %s\n", preview)
 
 	// 3. 构造向 PikPak 的请求
 	outReq, err := http.NewRequest(r.Method, downloadLink, r.Body)
@@ -77,12 +91,14 @@ func (d *PikPakClient) handleStream(w http.ResponseWriter, r *http.Request) {
 	// 5. 🔥 核心：注入特权 User-Agent 🔥
 	outReq.Header.Set("User-Agent", d.UserAgent)
 
-	// 6. 准备 HTTP Client (必须走代理!)
-	proxyURL, _ := url.Parse(d.ProxyAddr)
+	// 6. 准备 HTTP Client (按需走代理)
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-		// 禁用 HTTP2，流媒体传输在 HTTP1.1 下更稳定
 		ForceAttemptHTTP2: false,
+	}
+	if d.ProxyAddr != "" {
+		if proxyURL, err := url.Parse(d.ProxyAddr); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
 	}
 	// 设置较短的 Header 超时，但 Body 读取不设超时
 	client := &http.Client{
@@ -107,6 +123,5 @@ func (d *PikPakClient) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	// 9. 建立管道，传输数据流
-	// io.Copy 会自动处理缓冲，将 PikPak 的数据流搬运给 ResponseWriter
 	io.Copy(w, resp.Body)
 }

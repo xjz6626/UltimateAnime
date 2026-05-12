@@ -17,6 +17,7 @@ import (
 	"UltimateAnime/pkg/bangumi"
 	"UltimateAnime/pkg/config"
 	"UltimateAnime/pkg/crawler"
+	"UltimateAnime/pkg/imgproxy"
 	"UltimateAnime/pkg/pikpak"
 )
 
@@ -27,9 +28,22 @@ type App struct {
 	pikpakClient        *pikpak.PikPakClient
 	bangumiClient       *bangumi.BangumiClient
 	crawler             *crawler.Crawler
+	imgProxy            *imgproxy.Proxy     // 图片代理服务
 	logHistory          []map[string]string // 日志历史
 	currentAccountIndex int                 // 当前使用的账号索引
 	blockedAccounts     map[string]string   // 账号封禁状态 map[username]date (YYYY-MM-DD)
+}
+
+const bangumiCacheTTL = 24 * time.Hour
+
+type bangumiCacheEntry[T any] struct {
+	FetchedAt time.Time `json:"fetched_at"`
+	Data      T         `json:"data"`
+}
+
+type bangumiSubjectCache struct {
+	Subject  bangumi.SubjectDetail `json:"subject"`
+	Episodes []bangumi.Episode     `json:"episodes"`
 }
 
 var windowsPathReplacer = strings.NewReplacer(
@@ -84,6 +98,44 @@ func sanitizePathSegment(name string) string {
 	return cleaned
 }
 
+func (a *App) getCacheDir() string {
+	cwd, _ := os.Getwd()
+	return filepath.Join(cwd, "cache")
+}
+
+func (a *App) loadJSONCache(path string, target any) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if err := json.Unmarshal(data, target); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (a *App) saveJSONCache(path string, payload any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func (a *App) isCacheValid(fetchedAt time.Time) bool {
+	if fetchedAt.IsZero() {
+		return false
+	}
+	return time.Since(fetchedAt) < bangumiCacheTTL
+}
+
 // NewApp creates a new App application struct
 func NewApp() *App {
 	// 1. 初始化配置管理器 (自动读取 config.json)
@@ -92,9 +144,8 @@ func NewApp() *App {
 	// 2. 初始化 Bangumi 客户端
 	// 从配置中读取 Token (复刻 bangumi_api.py 的逻辑)
 	bgmToken := cfgMgr.Data.GlobalSettings.BangumiApiToken
-	// proxy := cfgMgr.Data.GlobalSettings.Proxy
-	// 用户反馈 Bangumi API 走代理可能超时，强制不使用代理
-	bgmClient := bangumi.NewClient(bgmToken, "")
+	proxy := cfgMgr.Data.GlobalSettings.Proxy
+	bgmClient := bangumi.NewClient(bgmToken, proxy)
 
 	// 3. 初始化资源爬虫 (复刻 search_torrents.py 的逻辑)
 	// 从配置中读取 torrent_api_url (默认 api.animes.garden)
@@ -102,10 +153,16 @@ func NewApp() *App {
 	// 用户反馈搜索走代理会导致搜不到中文资源，因此这里强制不使用代理
 	crawlerClient := crawler.NewCrawler(torrentApiUrl, "")
 
+	// 4. 初始化图片代理服务（用于绕过 Webview 直连 bgm.tv 被切的问题）
+	cwd, _ := os.Getwd()
+	imgProxySvc := imgproxy.New(filepath.Join(cwd, "cache", "images"))
+	imgProxySvc.SetProxy(proxy)
+
 	return &App{
 		configMgr:       cfgMgr,
 		bangumiClient:   bgmClient,
 		crawler:         crawlerClient,
+		imgProxy:        imgProxySvc,
 		logHistory:      make([]map[string]string, 0),
 		blockedAccounts: make(map[string]string),
 	}
@@ -114,6 +171,13 @@ func NewApp() *App {
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	// 🖼️ 立即启动图片代理服务（独立于 PikPak，不依赖登录）
+	if a.imgProxy != nil {
+		if err := a.imgProxy.Start("54321"); err != nil {
+			fmt.Printf("❌ [ImgProxy] 启动失败: %v\n", err)
+		}
+	}
 
 	// ⚡ 自动登录 PikPak (如果 config.json 里填了且开启了自动登录)
 	users := a.configMgr.Data.GlobalSettings.PikPakUsers
@@ -163,8 +227,10 @@ func (a *App) Login(username, password string) string {
 		runtime.EventsEmit(a.ctx, "pikpak-status", "Success")
 	}
 
-	// 🔥 启动本地流式代理 (固定端口 54321，供前端播放器使用)
-	client.StartServer("54321")
+	// 🔥 把 PikPak 的 /stream 流式代理挂到 imgproxy 的 mux 上（共享端口 54321）
+	if a.imgProxy != nil {
+		client.RegisterStreamHandler(a.imgProxy.Mux())
+	}
 
 	return "Success"
 }
@@ -242,7 +308,33 @@ func (a *App) DeleteTask(taskID string) string {
 // GetBangumiCalendar 获取新番日历
 func (a *App) GetBangumiCalendar() ([]bangumi.CalendarItem, error) {
 	fmt.Println("📅 [Bangumi] 获取新番日历...")
-	return a.bangumiClient.GetCalendar()
+	cachePath := filepath.Join(a.getCacheDir(), "bangumi_calendar.json")
+	var cache bangumiCacheEntry[[]bangumi.CalendarItem]
+	cacheLoaded, cacheErr := a.loadJSONCache(cachePath, &cache)
+	if cacheErr != nil {
+		a.Log("WARN", fmt.Sprintf("读取日历缓存失败: %v", cacheErr))
+	}
+
+	if cacheLoaded && a.isCacheValid(cache.FetchedAt) {
+		a.Log("INFO", "使用本地 Bangumi 日历缓存")
+		return cache.Data, nil
+	}
+
+	data, err := a.bangumiClient.GetCalendar()
+	if err != nil {
+		if cacheLoaded {
+			a.Log("WARN", fmt.Sprintf("获取日历失败，使用本地缓存: %v", err))
+			return cache.Data, nil
+		}
+		return nil, err
+	}
+
+	_ = a.saveJSONCache(cachePath, bangumiCacheEntry[[]bangumi.CalendarItem]{
+		FetchedAt: time.Now(),
+		Data:      data,
+	})
+
+	return data, nil
 }
 
 // SearchBangumi 搜索番剧信息
@@ -347,6 +439,11 @@ func (a *App) SaveAppConfig(jsonStr string) string {
 	// 实时应用部分配置
 	if newConfig.GlobalSettings.BangumiApiToken != "" {
 		a.bangumiClient.SetToken(newConfig.GlobalSettings.BangumiApiToken)
+	}
+
+	// 同步更新图片代理的上游代理地址
+	if a.imgProxy != nil {
+		a.imgProxy.SetProxy(newConfig.GlobalSettings.Proxy)
 	}
 
 	return "Success"
@@ -628,18 +725,54 @@ type AnimeDetail struct {
 func (a *App) GetAnimeDetail(subjectID int) (*AnimeDetail, error) {
 	a.Log("INFO", fmt.Sprintf("获取动漫详情: %d", subjectID))
 
-	// 1. 获取基本详情
-	subject, err := a.bangumiClient.GetSubjectDetail(subjectID)
-	if err != nil {
-		return nil, err
+	cachePath := filepath.Join(a.getCacheDir(), fmt.Sprintf("bangumi_subject_%d.json", subjectID))
+	var cache bangumiCacheEntry[bangumiSubjectCache]
+	cacheLoaded, cacheErr := a.loadJSONCache(cachePath, &cache)
+	if cacheErr != nil {
+		a.Log("WARN", fmt.Sprintf("读取详情缓存失败: %v", cacheErr))
 	}
 
-	// 2. 获取剧集列表
-	episodes, err := a.bangumiClient.GetSubjectEpisodes(subjectID)
-	if err != nil {
-		// 如果获取剧集失败，降级处理，只返回详情
-		a.Log("WARN", fmt.Sprintf("获取剧集失败: %v", err))
-		episodes = []bangumi.Episode{}
+	var subject *bangumi.SubjectDetail
+	var episodes []bangumi.Episode
+
+	if cacheLoaded && a.isCacheValid(cache.FetchedAt) {
+		a.Log("INFO", "使用本地 Bangumi 详情缓存")
+		subject = &cache.Data.Subject
+		episodes = cache.Data.Episodes
+	} else {
+		// 1. 获取基本详情
+		fetchedSubject, err := a.bangumiClient.GetSubjectDetail(subjectID)
+		if err != nil {
+			if cacheLoaded {
+				a.Log("WARN", fmt.Sprintf("获取详情失败，使用本地缓存: %v", err))
+				subject = &cache.Data.Subject
+				episodes = cache.Data.Episodes
+			} else {
+				return nil, err
+			}
+		} else {
+			subject = fetchedSubject
+			// 2. 获取剧集列表
+			fetchedEpisodes, err := a.bangumiClient.GetSubjectEpisodes(subjectID)
+			if err != nil {
+				// 如果获取剧集失败，降级处理
+				a.Log("WARN", fmt.Sprintf("获取剧集失败: %v", err))
+				if cacheLoaded {
+					episodes = cache.Data.Episodes
+				} else {
+					episodes = []bangumi.Episode{}
+				}
+			} else {
+				episodes = fetchedEpisodes
+				_ = a.saveJSONCache(cachePath, bangumiCacheEntry[bangumiSubjectCache]{
+					FetchedAt: time.Now(),
+					Data: bangumiSubjectCache{
+						Subject:  *subject,
+						Episodes: episodes,
+					},
+				})
+			}
+		}
 	}
 
 	// 3. 计算当前更新到了第几集

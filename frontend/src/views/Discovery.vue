@@ -38,7 +38,7 @@
           <div v-for="item in activeDayData.items" :key="item.id" @click="showDetail(item)" class="bg-gray-800 p-3 rounded hover:bg-gray-700 transition group cursor-pointer border border-transparent hover:border-pink-500/30">
             <div class="flex gap-3">
               <div class="w-20 h-28 flex-shrink-0 bg-gray-700 rounded overflow-hidden relative">
-                 <img v-if="item.images" :src="item.images.common || item.images.medium" class="w-full h-full object-cover group-hover:scale-110 transition duration-300" loading="lazy" />
+                 <img v-if="item.images" :src="proxyImg(item.images.common || item.images.medium)" @error="onImgError($event, item.images.common || item.images.medium)" referrerpolicy="no-referrer" class="w-full h-full object-cover group-hover:scale-110 transition duration-300" loading="lazy" />
                  <div class="absolute top-0 right-0 bg-pink-600 text-white text-[10px] px-1.5 py-0.5 rounded-bl" v-if="item.rating && item.rating.score >= 8">
                    {{ item.rating.score }}
                  </div>
@@ -92,7 +92,7 @@
             
             <div class="flex gap-4 mb-4">
               <div class="w-32 h-48 bg-gray-700 rounded overflow-hidden relative">
-                 <img v-if="detailData.images" :src="detailData.images.common || detailData.images.medium" class="w-full h-full object-cover" loading="lazy" />
+                 <img v-if="detailData.images" :src="proxyImg(detailData.images.common || detailData.images.medium)" @error="onImgError($event, detailData.images.common || detailData.images.medium)" referrerpolicy="no-referrer" class="w-full h-full object-cover" loading="lazy" />
               </div>
               
               <div class="flex-1 min-w-0">
@@ -139,7 +139,7 @@
         <div v-else-if="detailData" class="relative">
           <!-- 顶部大图背景 -->
           <div class="h-48 overflow-hidden relative">
-             <img :src="detailData.subject.images.large" class="w-full object-cover opacity-30 blur-sm transform scale-110">
+             <img :src="proxyImg(detailData.subject.images.large)" @error="onImgError($event, detailData.subject.images.large)" referrerpolicy="no-referrer" class="w-full object-cover opacity-30 blur-sm transform scale-110">
              <div class="absolute inset-0 bg-gradient-to-b from-transparent to-gray-900"></div>
              <button @click="selectedItem = null" class="absolute top-4 right-4 bg-black/50 text-white rounded-full w-8 h-8 flex items-center justify-center hover:bg-black/80">✕</button>
           </div>
@@ -147,7 +147,7 @@
           <div class="px-8 pb-8 -mt-20 relative flex flex-col md:flex-row gap-6 items-start">
             <!-- 封面图 -->
             <div class="w-48 flex-shrink-0 rounded-lg overflow-hidden shadow-2xl border-4 border-gray-800 bg-gray-800">
-              <img :src="detailData.subject.images.large || detailData.subject.images.common" class="w-full h-auto block">
+              <img :src="proxyImg(detailData.subject.images.large || detailData.subject.images.common)" @error="onImgError($event, detailData.subject.images.large || detailData.subject.images.common)" referrerpolicy="no-referrer" class="w-full h-auto block">
             </div>
             
             <!-- 信息区域 -->
@@ -289,6 +289,32 @@ const magnetPickerEp = ref(null);
 const magnetSearchKeyword = ref('');
 const magnetSearching = ref(false);
 const magnetCandidates = ref([]);
+
+// 把 bgm.tv 的图片走后端代理（绕开 Webview 直连被切的问题）
+// 后端代理服务在 127.0.0.1:54321，PikPak 登录后自动启动
+const proxyImg = (url) => {
+  if (!url) return '';
+  // 先升级 http -> https，避免混合内容警告
+  const httpsUrl = url.replace(/^http:\/\//i, 'https://');
+  // 已经是本地代理的不重复包装
+  if (httpsUrl.startsWith('http://127.0.0.1:')) return httpsUrl;
+  // 非 http(s) 直接返回（base64、data: 等）
+  if (!/^https?:\/\//i.test(httpsUrl)) return httpsUrl;
+  return `http://127.0.0.1:54321/img?u=${encodeURIComponent(httpsUrl)}`;
+};
+
+// 代理也加载失败时，回退到原始 URL 再尝试一次（万一用户的网络能直连呢）
+const onImgError = (event, originalUrl) => {
+  const img = event.target;
+  if (!img || !originalUrl) return;
+  // 标记一下，防止无限循环回退
+  if (img.dataset.fallback === '1') return;
+  img.dataset.fallback = '1';
+  const httpsUrl = originalUrl.replace(/^http:\/\//i, 'https://');
+  if (img.src !== httpsUrl) {
+    img.src = httpsUrl;
+  }
+};
 
 const showDetail = async (item) => {
   selectedItem.value = item;
