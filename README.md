@@ -1,3 +1,5 @@
+
+
 # UltimateAnime 📺
 
 ![Wails](https://img.shields.io/badge/Built%20With-Wails-red) ![Go](https://img.shields.io/badge/Backend-Go-blue) ![Vue](https://img.shields.io/badge/Frontend-Vue%203-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
@@ -215,7 +217,7 @@ chmod +x install.sh
     ],
     "pikpak_password": "统一的PikPak密码",
     "auto_login": true,
-    "proxy": "[http://127.0.0.1:7890](http://127.0.0.1:7890)" 
+    "proxy": "http://127.0.0.1:7890"
   },
   "local_storage": {
     "anime_dir": "Downloads/Anime"
