@@ -1,6 +1,7 @@
 package pikpak
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -408,10 +409,15 @@ func GetAction(method string, rawURL string) string {
 
 // DownloadFileConcurrent 并发下载分块，全部完成后替换目标文件。
 func (d *PikPakClient) DownloadFileConcurrent(fileID string, fileName string, fileSize int64, threadNum int, progress func(current, total int64)) error {
-	return d.downloadFileConcurrent(fileID, fileName, fileSize, threadNum, progress, nil)
+	return d.downloadFileConcurrent(fileID, fileName, fileSize, threadNum, progress, downloadOptions{})
 }
 
-func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fileSize int64, threadNum int, progress func(current, total int64), rangeTransport http.RoundTripper) error {
+type downloadOptions struct {
+	rangeTransport http.RoundTripper
+	retryWait      func(time.Duration)
+}
+
+func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fileSize int64, threadNum int, progress func(current, total int64), options downloadOptions) error {
 	if fileSize <= 0 {
 		return fmt.Errorf("PikPak 文件大小无效: %d", fileSize)
 	}
@@ -421,6 +427,43 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 	}
 	if urlStr == "" {
 		return errors.New("PikPak 未返回文件下载地址")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var linkMu sync.Mutex
+	var linkVersion uint64
+	currentLink := func() (string, uint64) {
+		linkMu.Lock()
+		defer linkMu.Unlock()
+		return urlStr, linkVersion
+	}
+	refreshLink := func(staleVersion uint64) error {
+		linkMu.Lock()
+		defer linkMu.Unlock()
+		if linkVersion != staleVersion {
+			return nil
+		}
+		link, err := d.GetDownloadUrl(fileID)
+		if err != nil {
+			return err
+		}
+		if link == "" {
+			return errors.New("PikPak 未返回新的文件下载地址")
+		}
+		urlStr = link
+		linkVersion++
+		return nil
+	}
+	retryWait := options.retryWait
+	if retryWait == nil {
+		retryWait = func(delay time.Duration) {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+		}
 	}
 	var proxyFunc func(*http.Request) (*url.URL, error)
 	if d.ProxyAddr != "" {
@@ -487,23 +530,34 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 			}
 			defer transport.CloseIdleConnections()
 			var requestTransport http.RoundTripper = transport
-			if rangeTransport != nil {
-				requestTransport = rangeTransport
+			if options.rangeTransport != nil {
+				requestTransport = options.rangeTransport
 			}
 			client := &http.Client{Transport: requestTransport, Timeout: 60 * time.Second}
 
 			for job := range jobs {
-				// 执行下载
-				req, reqErr := http.NewRequest("GET", urlStr, nil)
-				if reqErr != nil {
-					results <- reqErr
+				if err := ctx.Err(); err != nil {
+					results <- err
 					continue
 				}
-				req.Header.Set("User-Agent", d.UserAgent)
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", job.Start, job.End))
 				success := false
 				var lastErr error
-				for retry := 0; retry < 3; retry++ {
+				var refreshErr error
+				attempts := 0
+				for retry := 0; retry < 10; retry++ {
+					if err := ctx.Err(); err != nil {
+						lastErr = err
+						break
+					}
+					link, linkVersion := currentLink()
+					req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+					if reqErr != nil {
+						lastErr = fmt.Errorf("分块 %d 下载地址无效: %w", job.Index, reqErr)
+						break
+					}
+					req.Header.Set("User-Agent", d.UserAgent)
+					req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", job.Start, job.End))
+					attempts++
 					resp, err := client.Do(req)
 					if err == nil && (resp.StatusCode == 206 || (totalBlocks == 1 && resp.StatusCode == 200)) {
 						// 读取数据
@@ -555,23 +609,43 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 							progressChan <- -bytesRead
 						}
 					} else {
+						status := 0
 						if resp != nil {
-							// 打印错误状态码，方便调试
+							status = resp.StatusCode
 							lastErr = fmt.Errorf("分块 %d 下载返回 HTTP %d", job.Index, resp.StatusCode)
 							resp.Body.Close()
 						} else {
 							lastErr = fmt.Errorf("分块 %d 下载失败: %w", job.Index, err)
 						}
+						if (status == 200 && totalBlocks > 1) || (status >= 400 && status < 500 && status != 401 && status != 403 && status != 404 && status != 429) {
+							break
+						}
+						if ((status == 401 || status == 403 || status == 404) && (retry == 0 || retry == 3 || retry == 6)) || ((retry == 2 || retry == 5 || retry == 8) && (status == 429 || status >= 500)) {
+							if err := refreshLink(linkVersion); err != nil {
+								refreshErr = err
+							}
+						}
 					}
-					if retry < 2 {
-						time.Sleep(time.Duration(retry+1) * 500 * time.Millisecond)
+					if retry < 9 {
+						delay := time.Duration(1<<retry) * 500 * time.Millisecond
+						if delay > 5*time.Second {
+							delay = 5 * time.Second
+						}
+						retryWait(delay)
 					}
 				}
 
 				if success {
 					results <- nil
 				} else {
+					if attempts > 1 {
+						lastErr = fmt.Errorf("分块 %d 尝试 %d 次后仍失败: %w", job.Index, attempts, lastErr)
+					}
+					if refreshErr != nil {
+						lastErr = errors.Join(lastErr, fmt.Errorf("刷新下载地址失败: %w", refreshErr))
+					}
 					results <- lastErr
+					cancel()
 				}
 			}
 		}()

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type mockTransport func(*http.Request) (*http.Response, error)
@@ -233,9 +234,9 @@ func TestDownloadFileConcurrentStopsAfterFailedChunks(t *testing.T) {
 		requests++
 		return jsonResponse(req, http.StatusServiceUnavailable, `{"error":"unavailable"}`), nil
 	})
-	err := client.downloadFileConcurrent("file-id", path, 5, 1, nil, rangeTransport)
-	if err == nil || requests != 3 {
-		t.Fatalf("expected three attempts and an error, requests=%d error=%v", requests, err)
+	err := client.downloadFileConcurrent("file-id", path, 5, 1, nil, downloadOptions{rangeTransport: rangeTransport, retryWait: func(time.Duration) {}})
+	if err == nil || requests != 10 {
+		t.Fatalf("expected ten attempts and an error, requests=%d error=%v", requests, err)
 	}
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 		t.Fatalf("failed download left a destination file: %v", statErr)
@@ -257,12 +258,69 @@ func TestDownloadFileConcurrentWritesCompleteFile(t *testing.T) {
 		}
 		return &http.Response{StatusCode: http.StatusPartialContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("hello")), Request: req}, nil
 	})
-	if err := client.downloadFileConcurrent("file-id", path, 5, 1, nil, rangeTransport); err != nil {
+	if err := client.downloadFileConcurrent("file-id", path, 5, 1, nil, downloadOptions{rangeTransport: rangeTransport}); err != nil {
 		t.Fatal(err)
 	}
 	contents, err := os.ReadFile(path)
 	if err != nil || string(contents) != "hello" {
 		t.Fatalf("file contents=%q, err=%v", contents, err)
+	}
+}
+
+func TestDownloadFileConcurrentRefreshesLinkAfterServiceUnavailable(t *testing.T) {
+	client := NewPikPakClient("test@example.com", "password", "")
+	linkRequests := 0
+	client.Client.SetTransport(mockTransport(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "captcha") {
+			return jsonResponse(req, 200, `{"captcha_token":"captcha"}`), nil
+		}
+		linkRequests++
+		token := "old"
+		if linkRequests > 1 {
+			token = "new"
+		}
+		return jsonResponse(req, 200, fmt.Sprintf(`{"web_content_link":"https://cdn.example.test/file?token=%s"}`, token)), nil
+	}))
+	oldRequests, newRequests := 0, 0
+	rangeTransport := mockTransport(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Query().Get("token") == "old" {
+			oldRequests++
+			return jsonResponse(req, http.StatusServiceUnavailable, "unavailable"), nil
+		}
+		newRequests++
+		return &http.Response{StatusCode: http.StatusPartialContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("hello")), Request: req}, nil
+	})
+	path := filepath.Join(t.TempDir(), "episode.mkv")
+	err := client.downloadFileConcurrent("file-id", path, 5, 1, nil, downloadOptions{rangeTransport: rangeTransport, retryWait: func(time.Duration) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "hello" || oldRequests != 3 || newRequests != 1 || linkRequests != 2 {
+		t.Fatalf("contents=%q err=%v old=%d new=%d links=%d", contents, err, oldRequests, newRequests, linkRequests)
+	}
+}
+
+func TestDownloadFileConcurrentStopsOtherChunksAfterPermanentFailure(t *testing.T) {
+	client := NewPikPakClient("test@example.com", "password", "")
+	client.Client.SetTransport(mockTransport(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "captcha") {
+			return jsonResponse(req, 200, `{"captcha_token":"captcha"}`), nil
+		}
+		return jsonResponse(req, 200, `{"web_content_link":"https://cdn.example.test/file"}`), nil
+	}))
+	rangeRequests := 0
+	rangeTransport := mockTransport(func(req *http.Request) (*http.Response, error) {
+		rangeRequests++
+		return jsonResponse(req, http.StatusBadRequest, "bad request"), nil
+	})
+	path := filepath.Join(t.TempDir(), "episode.mkv")
+	err := client.downloadFileConcurrent("file-id", path, 4*1024*1024+1, 1, nil, downloadOptions{rangeTransport: rangeTransport})
+	if err == nil || rangeRequests != 1 {
+		t.Fatalf("error=%v requests=%d, want one request", err, rangeRequests)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("failed download left a destination file: %v", statErr)
 	}
 }
 
