@@ -13,7 +13,10 @@
 ## ✨ 核心功能特性
 
 ### 1. 📅 Bangumi 深度集成
-* **每日放送**：同步 Bangumi 每日新番放送列表，不错过每一集更新（本地缓存 24 小时）。
+* **每日放送**：每天刷新 Bangumi 放送列表；每周通过 AniList 核对已追番剧的下一集时间，确认跨季播出的已追番剧继续显示在新季度日历中。
+* **追番筛选**：在“我的追番”中可切换隐藏／显示已完结番剧。仅将 AniList 标记为 `FINISHED` 的作品视为完结；停播和排期未知的作品仍会显示。筛选选择只保存在当前浏览器中，不删除追番记录。
+* **追番优先**：每天查询已追番剧的当日播出排期，在“我的追番”中将今日播出的作品置顶。排期是预计电视播出时间，不代表磁力资源已经发布。
+* **ID 对照**：Bangumi 与 AniList 条目关联使用 [bangumi-data](https://github.com/bangumi-data/bangumi-data) 的数据（CC BY 4.0）。对照表缓存在 `cache/airing_mappings.json`，通常每 30 天更新一次；更新失败时继续使用旧表。未匹配的条目不会被自动判断为跨季续播。
 * **追番同步**：登录后可同步你的“在看”列表，管理观看进度。
 * **收藏管理**：支持在应用内直接标记“追番”、“看过”或“抛弃”。
 * **智能详情**：获取番剧详细信息、评分、别名及剧集列表（本地缓存 24 小时）。
@@ -29,7 +32,7 @@
 ### 3. ☁️ PikPak 云盘无缝对接
 * **离线下载**：一键将搜索到的磁力链接推送到 PikPak 云端实现秒传/离线下载。
 * **多账号轮询**：支持配置多个 PikPak 账号。当单日配额耗尽或遇风控时，系统自动切换备用账号，确保持续可用。
-* **智能空间管理** ⭐：空间不足时自动清理云盘，支持递归删除文件夹，释放空间后继续下载。
+* **智能空间管理** ⭐：空间不足时先永久清空当前 PikPak 账号的云盘并重试；若离线任务次数也已耗尽，再切换账号。
 * **账号管理** ⭐：可视化管理多个账号状态，支持手动封禁/解封账号，支持一键清空指定账号的云盘空间。
 * **流式播放**：内置本地 HTTP 代理服务器（Port: 54321），无需等待下载回本地，直接流式播放云盘视频。
 * **智能文件识别**：自动处理下载任务中的文件夹结构，智能定位视频主文件。
@@ -41,7 +44,7 @@
     * **本地播放**：自动检测已下载到本地的文件，优先本地播放。
 * **自定义参数**：支持自定义 MPV 启动参数（如全屏、着色器配置等）。
 * **集数管理** ⭐：
-    * **鼠标左键**：播放已下载的集数，或打开磁力选择窗口下载新集数。
+    * **鼠标左键**：播放已下载的集数；未下载时按设置手选磁力或自动优选并下载。
     * **鼠标右键**：标记/取消标记为已观看。
     * **鼠标中键**：删除该集的本地文件和/或磁力链接记录。
 
@@ -57,12 +60,12 @@
 
 ### 前置要求
 
-* **操作系统**：Windows 10/11 (macOS/Linux 理论支持，但需自行适配 MPV 路径)
-* **环境依赖**：
-    * [Go](https://go.dev/) 1.23+ （用于编译）
-    * [Node.js](https://nodejs.org/) 16+ (npm) （前端构建）
-    * [Wails CLI](https://wails.io/docs/gettingstarted/installation) （必须安装）
-    * [MPV Player](https://mpv.io/) （播放器，可选，用于本地播放）
+* **发布版**：Windows 10/11 amd64 或 Linux amd64。Windows 需要 WebView2 Runtime；Linux 需要 GTK 3 和 WebKit2GTK 4.1。MPV 只在本机播放时需要。
+* **源码构建**：[Go](https://go.dev/) 1.23+、[Node.js](https://nodejs.org/) 18+ (npm)。`wails dev` 还需要 [Wails CLI](https://wails.io/docs/gettingstarted/installation)。
+
+### 使用发布版
+
+从 [Releases](https://github.com/xjz6626/UltimateAnime/releases) 下载对应平台的 `UltimateAnime-v0.2.0-*-amd64.zip`，解压后按 [用户使用指南](README-用户使用.md) 首次配置。升级时只替换程序及文档，保留原来的 `config.json`、`followed.json` 和下载目录；v0.1 的两个 JSON 文件可以直接继续使用。
 
 ### 安装与运行
 
@@ -84,7 +87,7 @@ chmod +x install.sh
 安装脚本会自动：
 - ✅ 检测环境依赖
 - ✅ 安装 Wails CLI（如果未安装）
-- ✅ 安装 Go 和前端依赖
+- ✅ 下载 Go 模块和前端依赖
 - ✅ 创建配置文件模板
 
 #### 方式二：手动安装
@@ -126,11 +129,13 @@ chmod +x install.sh
     wails dev
     ```
 
-6.  **构建生产版本**
+6.  **在 Linux 上构建双平台发布包**
     ```bash
-    wails build
-    # 构建产物位于 build/bin/UltimateAnime.exe
+    ./scripts/build-release.sh v0.2.0
+    # dist/ 下生成 Linux、Windows 压缩包及 SHA256 校验文件
     ```
+
+    Linux 构建使用 `production,webkit2_41` 标签；Windows amd64 使用无控制台 GUI 子系统。发布包不包含 `config.json`、`followed.json`、缓存和下载内容。
 
 ### 首次使用配置
 
@@ -160,7 +165,9 @@ chmod +x install.sh
 
 应用运行时会在家中电脑的 `127.0.0.1:54322` 和当前 Tailscale IPv4 地址的 `54322` 端口提供网页版。它复用桌面端的 Vue 页面，可查看追番和当季新番、选择磁力链接、启动家中电脑的下载，并查看下载日志。网页端不提供账号设置、本地文件删除和播放器操作。
 
-1. 在家中电脑上连接 Tailscale，然后启动 UltimateAnime，并在桌面端完成 PikPak 登录。需要无人值守时，可在设置中开启自动登录。
+手机浏览器使用底部导航。打开番剧详情后点按集数，可选择下载资源或标记已观看；磁力搜索和候选列表可在整屏弹窗中滚动操作。
+
+1. 在家中电脑上连接 Tailscale，然后启动 UltimateAnime。先在桌面端配置好 PikPak 账号和密码；开始下载时才会连接 PikPak。
 2. 在家中电脑上运行 `tailscale ip -4`，记下显示的 IPv4 地址。
 3. 在上班电脑上连接同一个 tailnet，用浏览器打开 `http://<家中电脑的 Tailscale IPv4>:54322`。家中电脑和 UltimateAnime 需要保持运行。
 
@@ -176,7 +183,7 @@ chmod +x install.sh
    - 点击"💖 追番"添加到本地收藏
 
 2. **下载集数**
-   - 点击剧集按钮，弹出磁力选择窗口
+   - 点击剧集按钮，默认弹出磁力选择窗口；开启自动优选后会直接开始下载
    - 浏览所有候选资源，查看文件大小、来源等信息
    - 选择合适的版本（推荐选择简中/1080P）
    - 如果没有满意的结果，修改搜索关键词重新搜索
@@ -197,7 +204,7 @@ chmod +x install.sh
 ### 操作技巧
 
 * **集数按钮交互**：
-  - 🖱️ **左键**：播放/下载（打开磁力选择窗口）
+  - 🖱️ **左键**：播放/下载（按磁力选择设置手选或自动优选）
   - 🖱️ **右键**：标记观看状态
   - 🖱️ **中键**：删除本地文件和磁力记录
 
@@ -213,7 +220,7 @@ chmod +x install.sh
 
 ## ⚙️ 配置指南
 
-首次运行后，应用会自动生成 `config.json`。你也可以在应用的 **"系统设置"** 界面进行图形化配置。
+首次使用时从 `config.example.json` 复制出 `config.json`，并从 `followed.example.json` 复制出 `followed.json`。升级时保留原文件；新增配置项使用默认值，旧版 `auto_login` 字段会被忽略，因为 PikPak 现在只在开始下载时连接。桌面端也可通过 **“系统设置”** 修改配置。
 
 ### 关键配置项 (`config.json`)
 
@@ -226,11 +233,13 @@ chmod +x install.sh
       "account2@email.com"
     ],
     "pikpak_password": "统一的PikPak密码",
-    "auto_login": true,
     "proxy": "http://127.0.0.1:7890"
   },
   "local_storage": {
     "anime_dir": "Downloads/Anime"
+  },
+  "torrent_searcher": {
+    "auto_select_magnet": false
   },
   "player": {
     "mpv_path": "C:\\Program Files\\MPV\\mpv.exe",
@@ -240,6 +249,7 @@ chmod +x install.sh
 ```
 
 * **PikPak 账号**：建议配置多个账号以应对非会员的每日添加限制。
+* **auto_select_magnet**：默认 `false`，点击剧集后手选磁力；设为 `true` 后优先复用已保存的磁力，否则按字幕和画质排序选第一条并开始下载。自动搜索失败时仍可手选。
 * **Proxy**：如果你所在的网络环境无法直接访问 Bangumi 或 Anime Garden，请务必配置 HTTP 代理。
 
 ---
@@ -283,6 +293,7 @@ UltimateAnime/
 
 ### 🔥 磁力选择系统
 传统自动下载器常遇到版本不对、字幕组不符等问题，本项目创新性地引入**可视化磁力选择**：
+- 并行搜索 AnimeGarden 和蜜柑计划，按磁力哈希合并去重；单个来源暂时不可用时仍展示另一来源的结果
 - 搜索后展示所有候选资源的详细信息
 - 支持自定义关键词重新搜索
 - 一键对比文件大小、来源、发布时间

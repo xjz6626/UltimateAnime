@@ -34,7 +34,6 @@ type GlobalSettings struct {
 	DownloadHistoryFile string   `json:"download_history_file"`
 	PikPakUsers         []string `json:"pikpak_users"`    // 支持多账号轮询 (预留)
 	PikPakPassword      string   `json:"pikpak_password"` // 目前共用一个密码
-	AutoLogin           bool     `json:"auto_login"`      // 是否自动登录 PikPak
 	Proxy               string   `json:"proxy"`           // 代理地址 (http://127.0.0.1:7897)
 }
 
@@ -52,8 +51,9 @@ type SeasonalFetcher struct {
 
 // TorrentSearcher 磁力搜索配置
 type TorrentSearcher struct {
-	WatchlistFile string `json:"watchlist_file"`
-	OutputFile    string `json:"output_file"`
+	WatchlistFile    string `json:"watchlist_file"`
+	OutputFile       string `json:"output_file"`
+	AutoSelectMagnet bool   `json:"auto_select_magnet"`
 }
 
 // BTDownloader 下载器配置
@@ -106,7 +106,14 @@ func (m *Manager) Load() error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(file, &m.Data)
+	// Older config.json files lack fields added by newer releases. Start with
+	// current defaults, and only replace the live configuration after a full parse.
+	next := NewDefaultConfig()
+	if err := json.Unmarshal(file, &next); err != nil {
+		return err
+	}
+	m.Data = next
+	return nil
 }
 
 // Save 保存配置
@@ -120,6 +127,26 @@ func (m *Manager) Save() error {
 	}
 
 	return os.WriteFile(m.ConfigPath, data, 0644)
+}
+
+func (m *Manager) Snapshot() AppConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Data
+}
+
+func (m *Manager) Replace(data AppConfig) error {
+	encoded, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := os.WriteFile(m.ConfigPath, encoded, 0644); err != nil {
+		return err
+	}
+	m.Data = data
+	return nil
 }
 
 // SetBangumiToken 设置 Bangumi Token 和 UserID

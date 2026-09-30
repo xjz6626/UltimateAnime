@@ -25,6 +25,10 @@ body {
 }
 
 #app {
-    height: 100vh;
+    height: 100dvh;
     text-align: center;
+}
+
+.mobile-action-sheet {
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
 }

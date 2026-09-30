@@ -17,8 +17,10 @@ async function invoke(method, ...args) {
 }
 
 export const GetPikPakStatus = () => invoke('GetPikPakStatus');
+export const GetAutoSelectMagnet = () => invoke('GetAutoSelectMagnet');
 export const GetBangumiCalendar = () => invoke('GetBangumiCalendar');
 export const GetLocalFollows = () => invoke('GetLocalFollows');
+export const GetFollowAirings = () => invoke('GetFollowAirings');
 export const GetAnimeDetail = (id) => invoke('GetAnimeDetail', id);
 export const FollowLocal = (item) => invoke('FollowLocal', item);
 export const UnfollowLocal = (id) => invoke('UnfollowLocal', id);

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +34,12 @@ type App struct {
 	imgProxy            *imgproxy.Proxy     // 图片代理服务
 	logHistory          []map[string]string // 日志历史
 	logMu               sync.RWMutex
+	calendarMu          sync.Mutex
+	airingMu            sync.Mutex
 	webEvents           *webEventHub
+	loginMu             sync.Mutex
+	taskMu              sync.Mutex
+	stateMu             sync.RWMutex
 	currentAccountIndex int               // 当前使用的账号索引
 	blockedAccounts     map[string]string // 账号封禁状态 map[username]date (YYYY-MM-DD)
 }
@@ -175,6 +182,16 @@ func NewApp() *App {
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	if a.imgProxy != nil {
+		a.imgProxy.Mux().HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+			client := a.currentPikPakClient()
+			if client == nil {
+				http.Error(w, "PikPak 尚未连接", http.StatusServiceUnavailable)
+				return
+			}
+			client.ServeStream(w, r)
+		})
+	}
 
 	// 🖼️ 立即启动图片代理服务（独立于 PikPak，不依赖登录）
 	if a.imgProxy != nil {
@@ -183,41 +200,59 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.startWebServer(ctx)
+	go a.refreshCalendarLoop(ctx)
+	a.Log("INFO", "PikPak 将在开始下载时连接")
+}
 
-	// ⚡ 自动登录 PikPak (如果 config.json 里填了且开启了自动登录)
-	users := a.configMgr.Data.GlobalSettings.PikPakUsers
-	password := a.configMgr.Data.GlobalSettings.PikPakPassword
-	autoLogin := a.configMgr.Data.GlobalSettings.AutoLogin
-
-	if len(users) > 0 && password != "" && autoLogin {
-		// 异步登录，防止卡住启动画面
-		go func() {
-			for i, user := range users {
-				fmt.Printf("⚡ [AutoLogin] 尝试账号 (%d/%d): %s ...\n", i+1, len(users), user)
-				res := a.Login(user, password)
-				if res == "Success" {
-					fmt.Printf("✅ [AutoLogin] 账号 %s 登录成功！\n", user)
-					return
-				}
-				fmt.Printf("❌ [AutoLogin] 账号 %s 登录失败: %s，尝试下一个...\n", user, res)
-				// 稍微等待一下，避免请求过快
-				time.Sleep(1 * time.Second)
-			}
-			fmt.Println("❌ [AutoLogin] 所有账号均登录失败，请检查配置或手动登录。")
-		}()
-	} else {
-		fmt.Println("ℹ️ [AutoLogin] 自动登录已关闭或未配置账号")
+func (a *App) refreshCalendarLoop(ctx context.Context) {
+	refresh := func() {
+		if _, err := a.GetBangumiCalendar(); err != nil {
+			a.Log("WARN", fmt.Sprintf("后台刷新新番日历失败: %v", err))
+		}
 	}
+	refresh()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
+}
+
+func (a *App) currentPikPakClient() *pikpak.PikPakClient {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.pikpakClient
+}
+
+func (a *App) activatePikPakClient(client *pikpak.PikPakClient, index int) {
+	a.stateMu.Lock()
+	a.pikpakClient = client
+	if index >= 0 {
+		a.currentAccountIndex = index
+	}
+	a.stateMu.Unlock()
+	a.Log("SUCCESS", "PikPak 登录成功")
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "pikpak-status", "Success")
+	}
+	a.webEvents.publish("pikpak-status", "Success")
 }
 
 // --- 1. 用户认证 & 基础功能 ---
 
 // Login 登录 PikPak (前端调用)
 func (a *App) Login(username, password string) string {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
 	fmt.Printf("💻 登录请求: %s\n", username)
 
 	// 初始化 PikPak 客户端
-	proxy := a.configMgr.Data.GlobalSettings.Proxy
+	proxy := a.configMgr.Snapshot().GlobalSettings.Proxy
 	client := pikpak.NewPikPakClient(username, password, proxy)
 
 	// 尝试登录
@@ -226,17 +261,7 @@ func (a *App) Login(username, password string) string {
 	}
 
 	// 登录成功，保存实例
-	a.pikpakClient = client
-	a.Log("SUCCESS", "PikPak 登录成功")
-	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "pikpak-status", "Success")
-	}
-	a.webEvents.publish("pikpak-status", "Success")
-
-	// 🔥 把 PikPak 的 /stream 流式代理挂到 imgproxy 的 mux 上（共享端口 54321）
-	if a.imgProxy != nil {
-		client.RegisterStreamHandler(a.imgProxy.Mux())
-	}
+	a.activatePikPakClient(client, -1)
 
 	return "Success"
 }
@@ -257,10 +282,11 @@ func (a *App) SaveBangumiToken(token string, uid string) string {
 // GetFileList 获取网盘文件列表
 func (a *App) GetFileList(parentID string) ([]pikpak.File, error) {
 	fmt.Printf("📂 [PikPak] 获取文件列表, ParentID: %s\n", parentID)
-	if a.pikpakClient == nil {
+	client := a.currentPikPakClient()
+	if client == nil {
 		return nil, fmt.Errorf("请先登录 PikPak")
 	}
-	return a.pikpakClient.FileList(parentID)
+	return client.FileList(parentID)
 }
 
 // GetPlayLink 获取播放链接 (返回本地代理地址)
@@ -272,13 +298,15 @@ func (a *App) GetPlayLink(fileID string) string {
 
 // AddTask 添加离线下载任务 (磁力/URL)
 func (a *App) AddTask(magnet string) string {
-	if a.pikpakClient == nil {
-		return "Error: 请先登录 PikPak"
+	client := a.currentPikPakClient()
+	if client == nil {
+		if err := a.loginForDownload(); err != nil {
+			return fmt.Sprintf("Error: PikPak 登录失败: %v", err)
+		}
+		client = a.currentPikPakClient()
 	}
 
-	fmt.Printf("⬇️ [PikPak] 添加离线任务: %s\n", magnet)
-	// parentID 传空字符串，默认存入云盘根目录
-	task, err := a.pikpakClient.OfflineDownload(magnet, "", "")
+	task, _, err := a.addOfflineTaskWithRecovery(client, magnet, len(a.configMgr.Snapshot().GlobalSettings.PikPakUsers), a.nextPikPakClient)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
@@ -289,21 +317,23 @@ func (a *App) AddTask(magnet string) string {
 // GetTasks 获取离线任务列表 (用于前端进度条)
 func (a *App) GetTasks() ([]pikpak.OfflineTask, error) {
 	// fmt.Println("🔄 [PikPak] 刷新任务列表") // 轮询太频繁，暂不打印
-	if a.pikpakClient == nil {
+	client := a.currentPikPakClient()
+	if client == nil {
 		return nil, fmt.Errorf("not logged in")
 	}
 	// false = 只获取进行中/出错的任务，不看已完成的历史
-	return a.pikpakClient.OfflineList(false)
+	return client.OfflineList(false)
 }
 
 // DeleteTask 删除任务
 func (a *App) DeleteTask(taskID string) string {
 	fmt.Printf("🗑️ [PikPak] 删除任务: %s\n", taskID)
-	if a.pikpakClient == nil {
+	client := a.currentPikPakClient()
+	if client == nil {
 		return "Error: Not logged in"
 	}
 	// true 表示同时删除源文件，false 表示只删除任务记录
-	if err := a.pikpakClient.DeleteTask(taskID, false); err != nil {
+	if err := client.DeleteTask(taskID, false); err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
 	return "Success"
@@ -313,7 +343,11 @@ func (a *App) DeleteTask(taskID string) string {
 
 // GetBangumiCalendar 获取新番日历
 func (a *App) GetBangumiCalendar() ([]bangumi.CalendarItem, error) {
+	a.calendarMu.Lock()
+	defer a.calendarMu.Unlock()
 	fmt.Println("📅 [Bangumi] 获取新番日历...")
+	airings := a.GetFollowAirings()
+	follows := a.GetLocalFollows()
 	cachePath := filepath.Join(a.getCacheDir(), "bangumi_calendar.json")
 	var cache bangumiCacheEntry[[]bangumi.CalendarItem]
 	cacheLoaded, cacheErr := a.loadJSONCache(cachePath, &cache)
@@ -321,16 +355,16 @@ func (a *App) GetBangumiCalendar() ([]bangumi.CalendarItem, error) {
 		a.Log("WARN", fmt.Sprintf("读取日历缓存失败: %v", cacheErr))
 	}
 
-	if cacheLoaded && a.isCacheValid(cache.FetchedAt) {
+	if cacheLoaded && sameLocalDay(cache.FetchedAt, time.Now()) {
 		a.Log("INFO", "使用本地 Bangumi 日历缓存")
-		return cache.Data, nil
+		return mergeFollowedContinuations(cache.Data, follows, airings, time.Now()), nil
 	}
 
 	data, err := a.bangumiClient.GetCalendar()
 	if err != nil {
 		if cacheLoaded {
 			a.Log("WARN", fmt.Sprintf("获取日历失败，使用本地缓存: %v", err))
-			return cache.Data, nil
+			return mergeFollowedContinuations(cache.Data, follows, airings, time.Now()), nil
 		}
 		return nil, err
 	}
@@ -340,7 +374,7 @@ func (a *App) GetBangumiCalendar() ([]bangumi.CalendarItem, error) {
 		Data:      data,
 	})
 
-	return data, nil
+	return mergeFollowedContinuations(data, follows, airings, time.Now()), nil
 }
 
 // SearchBangumi 搜索番剧信息
@@ -353,7 +387,7 @@ func (a *App) SearchBangumi(keyword string) ([]bangumi.Subject, error) {
 func (a *App) GetMyCollection() ([]bangumi.UserCollection, error) {
 	fmt.Println("📚 [Bangumi] 获取我的收藏...")
 	// 如果 config.json 里配了 user_id 就用，否则用 "me"
-	uid := a.configMgr.Data.GlobalSettings.BangumiUserID
+	uid := a.configMgr.Snapshot().GlobalSettings.BangumiUserID
 	if uid == "" {
 		uid = "me"
 	}
@@ -362,7 +396,7 @@ func (a *App) GetMyCollection() ([]bangumi.UserCollection, error) {
 
 // --- 4. 资源搜索 (Crawler API) ---
 
-// SearchResource 搜索磁力链接 (动漫花园)
+// SearchResource 从 AnimeGarden 和蜜柑计划搜索磁力链接
 func (a *App) SearchResource(keyword string) ([]crawler.TorrentItem, error) {
 	fmt.Printf("🔍 [Crawler] 搜索资源: %s\n", keyword)
 
@@ -411,7 +445,7 @@ func (a *App) GetLogs() []map[string]string {
 
 // GetPikPakStatus 获取 PikPak 登录状态
 func (a *App) GetPikPakStatus() string {
-	if a.pikpakClient != nil {
+	if a.currentPikPakClient() != nil {
 		return "Success"
 	}
 	return "未登录"
@@ -429,7 +463,12 @@ func (a *App) UpdateCollectionStatus(subjectID int, status int) string {
 
 // GetAppConfig 获取当前配置
 func (a *App) GetAppConfig() config.AppConfig {
-	return a.configMgr.Data
+	return a.configMgr.Snapshot()
+}
+
+// GetAutoSelectMagnet 只暴露磁力选择模式，网页端无需读取包含账号密码的完整配置。
+func (a *App) GetAutoSelectMagnet() bool {
+	return a.configMgr.Snapshot().TorrentSearcher.AutoSelectMagnet
 }
 
 // SaveAppConfig 保存配置
@@ -440,11 +479,25 @@ func (a *App) SaveAppConfig(jsonStr string) string {
 		return fmt.Sprintf("Error: 解析配置失败 %v", err)
 	}
 
-	// 更新内存
-	a.configMgr.Data = newConfig
-	// 保存到文件
-	if err := a.configMgr.Save(); err != nil {
+	a.taskMu.Lock()
+	defer a.taskMu.Unlock()
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	oldConfig := a.configMgr.Snapshot()
+	if err := a.configMgr.Replace(newConfig); err != nil {
 		return fmt.Sprintf("Error: 保存文件失败 %v", err)
+	}
+	if oldConfig.GlobalSettings.PikPakPassword != newConfig.GlobalSettings.PikPakPassword ||
+		oldConfig.GlobalSettings.Proxy != newConfig.GlobalSettings.Proxy ||
+		!slices.Equal(oldConfig.GlobalSettings.PikPakUsers, newConfig.GlobalSettings.PikPakUsers) {
+		a.stateMu.Lock()
+		a.pikpakClient = nil
+		a.currentAccountIndex = 0
+		a.stateMu.Unlock()
+		if a.ctx != nil {
+			runtime.EventsEmit(a.ctx, "pikpak-status", "未登录")
+		}
+		a.webEvents.publish("pikpak-status", "未登录")
 	}
 
 	// 实时应用部分配置
@@ -455,6 +508,9 @@ func (a *App) SaveAppConfig(jsonStr string) string {
 	// 同步更新图片代理的上游代理地址
 	if a.imgProxy != nil {
 		a.imgProxy.SetProxy(newConfig.GlobalSettings.Proxy)
+	}
+	if a.crawler != nil {
+		a.crawler.SetAPIURL(newConfig.GlobalSettings.TorrentApiUrl)
 	}
 
 	return "Success"
@@ -587,6 +643,7 @@ func (a *App) SearchEpisodeMagnet(subjectID int, epSort float64) string {
 		a.Log("WARN", fmt.Sprintf("搜索失败: %v", err))
 		return fmt.Sprintf("Error: %v", err)
 	}
+	a.Log("INFO", fmt.Sprintf("自动优选资源: %s (来源: %s)", res.Title, res.Source))
 
 	// 5. 保存结果
 	if targetItem.EpisodeMagnets == nil {
@@ -827,78 +884,101 @@ func (a *App) GetAnimeDetail(subjectID int) (*AnimeDetail, error) {
 	}, nil
 }
 
-// getPikPakFileFromMagnet 从磁力链接获取 PikPak 文件信息 (自动处理文件夹)
-func (a *App) getPikPakFileFromMagnet(magnet string) (string, string, int64, error) {
-	if a.pikpakClient == nil {
-		if err := a.tryAutoLogin(); err != nil {
-			return "", "", 0, fmt.Errorf("请先登录 PikPak (%v)", err)
-		}
+func isPikPakStorageError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "file_space_not_enough") || strings.Contains(message, "api error 8")
+}
+
+func isPikPakQuotaError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "task_daily_create_limit") || strings.Contains(message, "api error 11")
+}
+
+func (a *App) nextPikPakClient() (*pikpak.PikPakClient, error) {
+	if err := a.switchToNextAccount(); err != nil {
+		return nil, err
 	}
+	return a.currentPikPakClient(), nil
+}
 
-	var task *pikpak.OfflineTask
-	var err error
-
-	// 尝试添加任务，如果遇到限额错误则切换账号重试
-	maxRetries := len(a.configMgr.Data.GlobalSettings.PikPakUsers)
-	if maxRetries == 0 {
-		maxRetries = 1
+// addOfflineTaskWithRecovery 空间不足时先清空并重试，确认次数耗尽后才切换账号。
+func (a *App) addOfflineTaskWithRecovery(client *pikpak.PikPakClient, magnet string, accountCount int, switchAccount func() (*pikpak.PikPakClient, error)) (*pikpak.OfflineTask, *pikpak.PikPakClient, error) {
+	a.taskMu.Lock()
+	defer a.taskMu.Unlock()
+	if current := a.currentPikPakClient(); current != nil {
+		client = current
 	}
-
-	for i := 0; i < maxRetries+1; i++ {
-		a.Log("INFO", fmt.Sprintf("正在添加磁力任务: %s", magnet))
-		task, err = a.pikpakClient.OfflineDownload(magnet, "", "")
-		if err == nil {
+	if client == nil {
+		return nil, nil, fmt.Errorf("PikPak 尚未登录")
+	}
+	if accountCount < 1 {
+		accountCount = 1
+	}
+	for accountAttempt := 0; accountAttempt < accountCount; accountAttempt++ {
+		cleared := false
+		for {
+			a.Log("INFO", fmt.Sprintf("正在通过账号 %s 添加离线任务", client.Username))
+			task, err := client.OfflineDownload(magnet, "", "")
+			if err == nil {
+				return task, client, nil
+			}
+			if isPikPakStorageError(err) {
+				if cleared {
+					return nil, nil, fmt.Errorf("账号 %s 清空后仍空间不足: %w", client.Username, err)
+				}
+				a.Log("WARN", fmt.Sprintf("账号 %s 空间不足，正在永久清空云盘后重试", client.Username))
+				if clearErr := client.ClearStorage(); clearErr != nil {
+					return nil, nil, fmt.Errorf("账号 %s 清空云盘失败: %w", client.Username, clearErr)
+				}
+				cleared = true
+				a.Log("SUCCESS", fmt.Sprintf("账号 %s 云盘已清空，重试当前账号", client.Username))
+				continue
+			}
+			if !isPikPakQuotaError(err) {
+				return nil, nil, fmt.Errorf("添加离线任务失败: %w", err)
+			}
+			if !cleared {
+				full, quotaErr := client.IsStorageFull()
+				if quotaErr != nil {
+					a.Log("WARN", fmt.Sprintf("查询账号 %s 的云盘容量失败: %v", client.Username, quotaErr))
+				} else if full {
+					a.Log("WARN", fmt.Sprintf("账号 %s 空间和离线任务次数均已耗尽，先永久清空云盘", client.Username))
+					if clearErr := client.ClearStorage(); clearErr != nil {
+						return nil, nil, fmt.Errorf("账号 %s 清空云盘失败: %w", client.Username, clearErr)
+					}
+					cleared = true
+					a.Log("SUCCESS", fmt.Sprintf("账号 %s 云盘已清空", client.Username))
+				}
+			}
+			a.markAccountBlocked(client.Username, "每日配额已满")
+			if accountAttempt == accountCount-1 || switchAccount == nil {
+				return nil, nil, fmt.Errorf("所有可用账号的离线任务次数已耗尽: %w", err)
+			}
+			a.Log("WARN", fmt.Sprintf("账号 %s 离线任务次数已耗尽，切换账号", client.Username))
+			nextClient, switchErr := switchAccount()
+			if switchErr != nil {
+				return nil, nil, fmt.Errorf("切换 PikPak 账号失败: %w", switchErr)
+			}
+			if nextClient == nil {
+				return nil, nil, fmt.Errorf("切换 PikPak 账号后未获得客户端")
+			}
+			client = nextClient
 			break
 		}
-
-		// 检查是否为限额错误 (api error 11) 或 空间不足 (api error 8)
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "task_daily_create_limit") || strings.Contains(errMsg, "api error 11") ||
-			strings.Contains(errMsg, "file_space_not_enough") || strings.Contains(errMsg, "api error 8") {
-
-			reason := "每日配额已满"
-			if strings.Contains(errMsg, "file_space_not_enough") || strings.Contains(errMsg, "api error 8") {
-				reason = "云盘空间不足"
-				// 空间不足时，异步清理当前账号空间，并立即切换账号
-				a.Log("WARN", "当前账号空间不足，启动后台彻底清理（永久删除所有文件）...")
-
-				// 捕获当前客户端实例和账号名，用于后台清理
-				currentClient := a.pikpakClient
-				currentUsername := ""
-				if currentClient != nil {
-					currentUsername = currentClient.Username
-				}
-
-				go func(client *pikpak.PikPakClient, username string) {
-					if client != nil {
-						a.Log("INFO", fmt.Sprintf("🧹 [后台清理] 开始清空账号 %s 的云盘空间...", username))
-						if clearErr := client.ClearStorage(); clearErr != nil {
-							a.Log("ERROR", fmt.Sprintf("❌ [后台清理] 账号 %s 清理失败: %v", username, clearErr))
-						} else {
-							a.Log("SUCCESS", fmt.Sprintf("✅ [后台清理] 账号 %s 空间清理完成，所有文件已永久删除", username))
-						}
-					}
-				}(currentClient, currentUsername)
-			}
-
-			a.Log("WARN", fmt.Sprintf("当前账号不可用 (%s)，尝试切换账号...", reason))
-
-			// 标记当前账号今日不可用
-			if a.pikpakClient != nil {
-				a.markAccountBlocked(a.pikpakClient.Username, reason)
-			}
-
-			if switchErr := a.switchToNextAccount(); switchErr != nil {
-				a.Log("ERROR", fmt.Sprintf("切换账号失败: %v", switchErr))
-				return "", "", 0, fmt.Errorf("添加任务失败 (%v) 且切换账号失败 (%v)", err, switchErr)
-			}
-			continue
-		}
-		return "", "", 0, fmt.Errorf("添加任务失败: %v", err)
 	}
+	return nil, nil, fmt.Errorf("所有账号均无法添加离线任务")
+}
 
+// getPikPakFileFromMagnet 从磁力链接获取 PikPak 文件信息 (自动处理文件夹)
+func (a *App) getPikPakFileFromMagnet(magnet string) (string, string, int64, *pikpak.PikPakClient, error) {
+	if a.currentPikPakClient() == nil {
+		if err := a.loginForDownload(); err != nil {
+			return "", "", 0, nil, fmt.Errorf("PikPak 登录失败: %w", err)
+		}
+	}
+	task, client, err := a.addOfflineTaskWithRecovery(a.currentPikPakClient(), magnet, len(a.configMgr.Snapshot().GlobalSettings.PikPakUsers), a.nextPikPakClient)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("所有账号均无法添加任务: %v", err)
+		return "", "", 0, nil, err
 	}
 
 	a.Log("INFO", fmt.Sprintf("任务添加成功，TaskID: %s, FileID: %s, Phase: %s", task.ID, task.FileID, task.Phase))
@@ -916,7 +996,7 @@ func (a *App) getPikPakFileFromMagnet(magnet string) (string, string, int64, err
 		for i := 0; i < 60; i++ { // 最多等待 60秒
 			time.Sleep(1 * time.Second)
 			// includeDone=true 以便能查到已完成的任务
-			tasks, err := a.pikpakClient.OfflineList(true)
+			tasks, err := client.OfflineList(true)
 			if err != nil {
 				a.Log("WARN", fmt.Sprintf("轮询任务列表失败: %v", err))
 				continue
@@ -933,20 +1013,20 @@ func (a *App) getPikPakFileFromMagnet(magnet string) (string, string, int64, err
 						a.Log("INFO", fmt.Sprintf("任务已完成，FileID: %s", fileID))
 						goto Found
 					} else if t.Phase == "PHASE_TYPE_ERROR" {
-						return "", "", 0, fmt.Errorf("离线下载失败 %s", t.Message)
+						return "", "", 0, nil, fmt.Errorf("离线下载失败 %s", t.Message)
 					}
 					// 仍在运行中...
 				}
 			}
 		}
-		return "", "", 0, fmt.Errorf("离线下载超时或未完成")
+		return "", "", 0, nil, fmt.Errorf("离线下载超时或未完成")
 	}
 
 Found:
 	a.Log("INFO", fmt.Sprintf("离线完成，初始ID: %s", fileID))
 
 	// 检查是否为文件夹
-	fileInfo, err := a.pikpakClient.GetFile(fileID)
+	fileInfo, err := client.GetFile(fileID)
 
 	// 容错：如果 ID 找不到文件，尝试通过文件名在根目录搜索
 	if err != nil {
@@ -955,7 +1035,7 @@ Found:
 			// 只获取前 100 个文件，避免太慢
 			// 注意：这里调用 FileList 会获取所有文件，如果文件太多可能会慢
 			// 暂时先这样，后续可以优化 FileList 支持 limit
-			files, listErr := a.pikpakClient.FileList("")
+			files, listErr := client.FileList("")
 			if listErr == nil {
 				for _, f := range files {
 					if f.Name == finalTaskName {
@@ -972,14 +1052,14 @@ Found:
 	}
 
 	if err != nil {
-		return "", "", 0, fmt.Errorf("无法获取文件信息: %v", err)
+		return "", "", 0, nil, fmt.Errorf("无法获取文件信息: %v", err)
 	}
 
 	if fileInfo.Kind == "drive#folder" {
 		a.Log("INFO", "检测到文件夹，正在寻找视频文件...")
-		files, err := a.pikpakClient.FileList(fileID)
+		files, err := client.FileList(fileID)
 		if err != nil {
-			return "", "", 0, fmt.Errorf("获取文件夹内容失败 %v", err)
+			return "", "", 0, nil, fmt.Errorf("获取文件夹内容失败 %v", err)
 		}
 
 		var largestFile *pikpak.File
@@ -1002,29 +1082,47 @@ Found:
 		if largestFile != nil {
 			size, _ := strconv.ParseInt(largestFile.Size, 10, 64)
 			a.Log("INFO", fmt.Sprintf("找到最大视频文件: %s (%d bytes)", largestFile.Name, size))
-			return largestFile.Id, largestFile.Name, size, nil
+			return largestFile.Id, largestFile.Name, size, client, nil
 		}
-		return "", "", 0, fmt.Errorf("文件夹中未找到视频文件")
+		return "", "", 0, nil, fmt.Errorf("文件夹中未找到视频文件")
 	}
 
 	// 如果是单文件
 	if fileInfo != nil {
 		size, _ := strconv.ParseInt(fileInfo.Size, 10, 64)
-		return fileInfo.Id, fileInfo.Name, size, nil
+		return fileInfo.Id, fileInfo.Name, size, client, nil
 	}
 
-	return "", "", 0, fmt.Errorf("无法获取文件信息")
+	return "", "", 0, nil, fmt.Errorf("无法获取文件信息")
 }
 
 // DownloadEpisode 下载单集
 func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) string {
+	if subjectID <= 0 || epSort <= 0 || !strings.HasPrefix(strings.ToLower(magnet), "magnet:?xt=urn:btih:") {
+		return "Error: 无效的番剧、集数或磁力链接"
+	}
+	if a.configMgr == nil {
+		return "Error: PikPak 配置未初始化"
+	}
+	settings := a.configMgr.Snapshot().GlobalSettings
+	if a.currentPikPakClient() == nil && (len(settings.PikPakUsers) == 0 || settings.PikPakPassword == "") {
+		return "Error: 请先在桌面设置中配置 PikPak 账号和密码"
+	}
 	a.Log("INFO", fmt.Sprintf("开始下载任务: ID=%d, Ep=%v", subjectID, epSort))
 
 	go func() {
+		reportError := func(err error) {
+			a.Log("ERROR", fmt.Sprintf("下载失败: %v", err))
+			data := map[string]interface{}{"subject_id": subjectID, "ep_sort": epSort, "error": err.Error()}
+			if a.ctx != nil {
+				runtime.EventsEmit(a.ctx, "download-error", data)
+			}
+			a.webEvents.publish("download-error", data)
+		}
 		// 1. 获取文件信息
-		fileID, fileName, fileSize, err := a.getPikPakFileFromMagnet(magnet)
+		fileID, fileName, fileSize, client, err := a.getPikPakFileFromMagnet(magnet)
 		if err != nil {
-			a.Log("ERROR", fmt.Sprintf("下载准备失败: %v", err))
+			reportError(err)
 			return
 		}
 
@@ -1043,7 +1141,7 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 		cwd, _ := os.Getwd()
 		downloadDir := filepath.Join(cwd, "Downloads", animeName)
 		if err := os.MkdirAll(downloadDir, 0755); err != nil {
-			a.Log("ERROR", fmt.Sprintf("创建目录失败: %v", err))
+			reportError(err)
 			return
 		}
 
@@ -1057,7 +1155,7 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 		var speed int64 = 0
 		lastProgressLogTime := time.Now().Add(-10 * time.Second)
 
-		err = a.pikpakClient.DownloadFileConcurrent(fileID, savePath, fileSize, 16, func(current, total int64) {
+		err = client.DownloadFileConcurrent(fileID, savePath, fileSize, 16, func(current, total int64) {
 			now := time.Now()
 			duration := now.Sub(lastTime)
 
@@ -1097,7 +1195,7 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 		fmt.Println() // 换行
 
 		if err != nil {
-			a.Log("ERROR", fmt.Sprintf("下载失败: %v", err))
+			reportError(err)
 			return
 		}
 
@@ -1191,7 +1289,8 @@ func (a *App) PlayLocalEpisode(subjectID int, epSort float64) string {
 	a.Log("INFO", fmt.Sprintf("启动 MPV 播放本地文件: %s", filePath))
 
 	// 优先使用配置中的 MPV 路径
-	mpvPath := a.configMgr.Data.Player.MPVPath
+	playerSettings := a.configMgr.Snapshot().Player
+	mpvPath := playerSettings.MPVPath
 	if mpvPath == "" {
 		mpvPath = "mpv" // 默认尝试环境变量
 		if _, err := os.Stat("mpv.exe"); err == nil {
@@ -1203,9 +1302,9 @@ func (a *App) PlayLocalEpisode(subjectID int, epSort float64) string {
 
 	// 构造参数
 	args := []string{filePath, "--force-window"}
-	if a.configMgr.Data.Player.MPVArgs != "" {
+	if playerSettings.MPVArgs != "" {
 		// 简单分割参数，不支持带空格的引号参数，后续可优化
-		userArgs := strings.Fields(a.configMgr.Data.Player.MPVArgs)
+		userArgs := strings.Fields(playerSettings.MPVArgs)
 		args = append(args, userArgs...)
 	}
 
@@ -1230,7 +1329,7 @@ func (a *App) PlayLocalEpisode(subjectID int, epSort float64) string {
 
 // PlayMagnet 添加磁力并调用 MPV 播放
 func (a *App) PlayMagnet(magnet string) string {
-	fileID, fileName, _, err := a.getPikPakFileFromMagnet(magnet)
+	fileID, fileName, _, client, err := a.getPikPakFileFromMagnet(magnet)
 	if err != nil {
 		return fmt.Sprintf("Error: %v", err)
 	}
@@ -1238,7 +1337,7 @@ func (a *App) PlayMagnet(magnet string) string {
 	a.Log("INFO", fmt.Sprintf("准备播放文件: %s (ID: %s)", fileName, fileID))
 
 	// 获取播放链接
-	playUrl, err := a.pikpakClient.GetDownloadUrl(fileID)
+	playUrl, err := client.GetDownloadUrl(fileID)
 	if err != nil {
 		return fmt.Sprintf("Error: 获取播放链接失败 %v", err)
 	}
@@ -1247,7 +1346,8 @@ func (a *App) PlayMagnet(magnet string) string {
 	a.Log("INFO", "启动 MPV 播放器...")
 
 	// 优先使用配置中的 MPV 路径
-	mpvPath := a.configMgr.Data.Player.MPVPath
+	playerSettings := a.configMgr.Snapshot().Player
+	mpvPath := playerSettings.MPVPath
 	if mpvPath == "" {
 		mpvPath = "mpv" // 默认尝试环境变量
 		if _, err := os.Stat("mpv.exe"); err == nil {
@@ -1262,8 +1362,8 @@ func (a *App) PlayMagnet(magnet string) string {
 	// 使用 --http-header-fields 设置 User-Agent，防止 403
 	args := []string{playUrl, "--force-window", "--http-header-fields=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
 
-	if a.configMgr.Data.Player.MPVArgs != "" {
-		userArgs := strings.Fields(a.configMgr.Data.Player.MPVArgs)
+	if playerSettings.MPVArgs != "" {
+		userArgs := strings.Fields(playerSettings.MPVArgs)
 		args = append(args, userArgs...)
 	}
 
@@ -1287,14 +1387,18 @@ func (a *App) PlayMagnet(magnet string) string {
 
 // GetBlockedAccounts 获取当前被封禁的账号列表
 func (a *App) GetBlockedAccounts() map[string]string {
-	if a.blockedAccounts == nil {
-		return map[string]string{}
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	result := make(map[string]string, len(a.blockedAccounts))
+	for user, date := range a.blockedAccounts {
+		result[user] = date
 	}
-	return a.blockedAccounts
+	return result
 }
 
 // SetAccountBlockStatus 手动设置账号封禁状态
 func (a *App) SetAccountBlockStatus(username string, blocked bool) string {
+	a.stateMu.Lock()
 	if a.blockedAccounts == nil {
 		a.blockedAccounts = make(map[string]string)
 	}
@@ -1303,17 +1407,19 @@ func (a *App) SetAccountBlockStatus(username string, blocked bool) string {
 		// 封禁：设置为今天
 		today := time.Now().Format("2006-01-02")
 		a.blockedAccounts[username] = today
-		a.Log("INFO", fmt.Sprintf("手动封禁账号: %s", username))
 	} else {
 		// 解封：删除记录
 		delete(a.blockedAccounts, username)
-		a.Log("INFO", fmt.Sprintf("手动解封账号: %s", username))
 	}
+	a.stateMu.Unlock()
+	a.Log("INFO", fmt.Sprintf("账号 %s 封禁状态设为 %v", username, blocked))
 	return "Success"
 }
 
 // isAccountBlocked 检查账号是否今日不可用
 func (a *App) isAccountBlocked(username string) bool {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
 	if a.blockedAccounts == nil {
 		return false
 	}
@@ -1328,49 +1434,67 @@ func (a *App) isAccountBlocked(username string) bool {
 
 // markAccountBlocked 标记账号今日不可用
 func (a *App) markAccountBlocked(username string, reason string) {
+	a.stateMu.Lock()
 	if a.blockedAccounts == nil {
 		a.blockedAccounts = make(map[string]string)
 	}
 	today := time.Now().Format("2006-01-02")
 	a.blockedAccounts[username] = today
+	a.stateMu.Unlock()
 	a.Log("WARN", fmt.Sprintf("账号 %s 已被标记为今日不可用 (原因: %s)", username, reason))
 }
 
-// tryAutoLogin 尝试自动登录 (遍历所有账号直到成功)
-func (a *App) tryAutoLogin() error {
-	users := a.configMgr.Data.GlobalSettings.PikPakUsers
+// loginForDownload 在开始下载时遍历已保存的 PikPak 账号。
+func (a *App) loginForDownload() error {
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	return a.loginForDownloadLocked(false)
+}
+
+func (a *App) loginForDownloadLocked(next bool) error {
+	if !next && a.currentPikPakClient() != nil {
+		return nil
+	}
+	settings := a.configMgr.Snapshot().GlobalSettings
+	users := settings.PikPakUsers
 	if len(users) == 0 {
 		return fmt.Errorf("未配置 PikPak 账号")
 	}
-
-	// 确保索引有效
-	if a.currentAccountIndex >= len(users) {
-		a.currentAccountIndex = 0
+	password := settings.PikPakPassword
+	if password == "" {
+		return fmt.Errorf("未配置 PikPak 密码")
 	}
 
+	a.stateMu.RLock()
 	startIndex := a.currentAccountIndex
+	a.stateMu.RUnlock()
+	if startIndex >= len(users) {
+		startIndex = 0
+	}
+	if next {
+		startIndex = (startIndex + 1) % len(users)
+	}
 	count := len(users)
 
 	for i := 0; i < count; i++ {
 		idx := (startIndex + i) % count
-		username := users[idx]
+		username := strings.TrimSpace(users[idx])
+		if username == "" {
+			continue
+		}
 
 		if a.isAccountBlocked(username) {
 			a.Log("WARN", fmt.Sprintf("跳过今日不可用账号: %s", username))
 			continue
 		}
 
-		password := a.configMgr.Data.GlobalSettings.PikPakPassword
-
 		a.Log("INFO", fmt.Sprintf("尝试登录账号 (%d/%d): %s", i+1, count, username))
 
-		proxy := a.configMgr.Data.GlobalSettings.Proxy
+		proxy := settings.Proxy
 		client := pikpak.NewPikPakClient(username, password, proxy)
 		err := client.Login()
 		if err == nil {
-			a.pikpakClient = client
-			a.currentAccountIndex = idx
-			a.Log("INFO", fmt.Sprintf("账号 %s 登录成功", username))
+			a.activatePikPakClient(client, idx)
 			return nil
 		}
 
@@ -1388,13 +1512,13 @@ func (a *App) tryAutoLogin() error {
 
 // switchToNextAccount 切换到下一个账号
 func (a *App) switchToNextAccount() error {
-	users := a.configMgr.Data.GlobalSettings.PikPakUsers
+	users := a.configMgr.Snapshot().GlobalSettings.PikPakUsers
 	if len(users) <= 1 {
 		return fmt.Errorf("只有一个账号，无法切换")
 	}
-
-	a.currentAccountIndex = (a.currentAccountIndex + 1) % len(users)
-	return a.tryAutoLogin()
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	return a.loginForDownloadLocked(true)
 }
 
 // formatBytes 格式化字节数
@@ -1506,15 +1630,17 @@ func (a *App) DeleteEpisodeData(subjectID int, epSort float64) string {
 // ClearPikPakStorage 手动清空指定 PikPak 账号的云盘空间
 // username: 要清空的账号，如果为空则清空当前登录账号
 func (a *App) ClearPikPakStorage(username string) string {
+	client := a.currentPikPakClient()
 	// 如果指定了账号，需要先登录
-	if username != "" && (a.pikpakClient == nil || a.pikpakClient.Username != username) {
-		password := a.configMgr.Data.GlobalSettings.PikPakPassword
+	if username != "" && (client == nil || client.Username != username) {
+		settings := a.configMgr.Snapshot().GlobalSettings
+		password := settings.PikPakPassword
 		if password == "" {
 			return "Error: 未配置密码"
 		}
 
 		a.Log("INFO", fmt.Sprintf("🔐 切换到账号 %s 进行清空操作...", username))
-		proxy := a.configMgr.Data.GlobalSettings.Proxy
+		proxy := settings.Proxy
 		client := pikpak.NewPikPakClient(username, password, proxy)
 
 		if err := client.Login(); err != nil {
@@ -1535,16 +1661,16 @@ func (a *App) ClearPikPakStorage(username string) string {
 	}
 
 	// 清空当前账号
-	if a.pikpakClient == nil {
+	if client == nil {
 		return "Error: 请先登录 PikPak"
 	}
 
-	currentUsername := a.pikpakClient.Username
+	currentUsername := client.Username
 	a.Log("INFO", fmt.Sprintf("🧹 开始清空账号 %s 的云盘空间...", currentUsername))
 
 	// 异步执行清理，避免阻塞前端
 	go func() {
-		if err := a.pikpakClient.ClearStorage(); err != nil {
+		if err := client.ClearStorage(); err != nil {
 			a.Log("ERROR", fmt.Sprintf("❌ 清空失败: %v", err))
 		} else {
 			a.Log("SUCCESS", fmt.Sprintf("✅ 账号 %s 的云盘空间已清空（所有文件已永久删除）", currentUsername))

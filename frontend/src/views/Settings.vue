@@ -49,16 +49,23 @@
             <input v-model="config.global_settings.pikpak_password" type="password" class="w-full bg-gray-900 border border-gray-700 rounded p-2.5 text-white focus:border-pink-500 focus:outline-none transition-colors" placeholder="输入密码">
           </div>
 
-          <div class="pt-2 flex items-center justify-between">
-            <label class="text-sm text-gray-400">启动时自动登录</label>
-            <div class="relative inline-block w-12 mr-2 align-middle select-none transition duration-200 ease-in">
-                <input type="checkbox" v-model="config.global_settings.auto_login" class="toggle-checkbox absolute block w-6 h-6 rounded-full bg-white border-4 appearance-none cursor-pointer transition-transform duration-200 ease-in-out" :class="{'translate-x-6 border-pink-600': config.global_settings.auto_login, 'border-gray-300': !config.global_settings.auto_login}"/>
-                <label class="toggle-label block overflow-hidden h-6 rounded-full bg-gray-700 cursor-pointer" :class="{'bg-pink-900': config.global_settings.auto_login}"></label>
-            </div>
-          </div>
+          <p class="text-sm text-gray-400 pt-2">PikPak 会在开始下载时登录。空间不足时会永久清空当前账号云盘并重试；次数也耗尽时才切换账号。</p>
 
           <!-- 去掉原来的手动清空云盘按钮区域 -->
         </div>
+      </div>
+
+      <!-- 磁力选择方式 -->
+      <div class="bg-gray-800 p-6 rounded-lg shadow-lg">
+        <h2 class="text-lg font-semibold mb-4 text-pink-500">🧲 磁力选择</h2>
+        <label class="flex items-center justify-between gap-4 cursor-pointer">
+          <span>
+            <span class="block font-medium">自动优选并下载</span>
+            <span class="block text-sm text-gray-400 mt-1">开启后点击未下载的剧集，会按字幕和画质排序选择首条资源并开始下载；关闭时显示候选列表供你手选。</span>
+          </span>
+          <input v-model="config.torrent_searcher.auto_select_magnet" type="checkbox" class="w-5 h-5 accent-pink-500 flex-shrink-0">
+        </label>
+        <p class="text-xs text-gray-400 mt-3">已保存的磁力链接会优先复用。自动搜索失败时会打开手选窗口。</p>
       </div>
 
       <!-- 播放器设置 -->
@@ -124,8 +131,9 @@ import { GetAppConfig, SaveAppConfig, GetBlockedAccounts, SetAccountBlockStatus,
 const saving = ref(false);
 const clearingAccounts = ref({});
 const config = ref({
-  global_settings: { pikpak_users: [''], pikpak_password: '', proxy: '', auto_login: false },
+  global_settings: { pikpak_users: [''], pikpak_password: '', proxy: '' },
   local_storage: { anime_dir: '' },
+  torrent_searcher: { auto_select_magnet: false },
   player: { mpv_path: '', mpv_args: '' }
 });
 const blockedAccounts = ref({});
@@ -136,6 +144,7 @@ const loadConfig = async () => {
     // 确保数组存在
     if (!res.global_settings.pikpak_users) res.global_settings.pikpak_users = [''];
     if (res.global_settings.pikpak_users.length === 0) res.global_settings.pikpak_users.push('');
+    if (!res.torrent_searcher) res.torrent_searcher = { auto_select_magnet: false };
     // 确保 player 存在
     if (!res.player) res.player = { mpv_path: '', mpv_args: '' };
     

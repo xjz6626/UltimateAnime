@@ -252,6 +252,11 @@ func (a *App) webCall(method string, args []json.RawMessage) (any, error) {
 			return nil, err
 		}
 		return a.GetPikPakStatus(), nil
+	case "GetAutoSelectMagnet":
+		if err := webArgs(args); err != nil {
+			return nil, err
+		}
+		return a.GetAutoSelectMagnet(), nil
 	case "GetBangumiCalendar":
 		if err := webArgs(args); err != nil {
 			return nil, err
@@ -262,6 +267,11 @@ func (a *App) webCall(method string, args []json.RawMessage) (any, error) {
 			return nil, err
 		}
 		return a.GetLocalFollows(), nil
+	case "GetFollowAirings":
+		if err := webArgs(args); err != nil {
+			return nil, err
+		}
+		return a.GetFollowAirings(), nil
 	case "GetLogs":
 		if err := webArgs(args); err != nil {
 			return nil, err
@@ -321,9 +331,6 @@ func (a *App) webCall(method string, args []json.RawMessage) (any, error) {
 		var magnet string
 		if err := webArgs(args, &id, &episode, &magnet); err != nil {
 			return nil, err
-		}
-		if a.GetPikPakStatus() != "Success" {
-			return nil, errors.New("请先在家里的桌面端登录 PikPak")
 		}
 		return a.DownloadEpisode(id, episode, magnet), nil
 	default:

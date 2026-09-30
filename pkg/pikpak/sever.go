@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 )
 
 // RegisterStreamHandler 把 /stream 流式代理注册到指定 mux 上
@@ -13,6 +12,10 @@ import (
 func (d *PikPakClient) RegisterStreamHandler(mux *http.ServeMux) {
 	mux.HandleFunc("/stream", d.handleStream)
 	fmt.Println("🚀 [PikPak] /stream 流式代理已注册")
+}
+
+func (d *PikPakClient) ServeStream(w http.ResponseWriter, r *http.Request) {
+	d.handleStream(w, r)
 }
 
 // StartServer 保留旧接口以兼容（独立启动，自带 mux）
@@ -61,30 +64,20 @@ func (d *PikPakClient) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 安全打印：直链可能短于 50 字符（极端情况），切片要做边界检查
-	preview := downloadLink
-	if len(preview) > 50 {
-		preview = preview[:50] + "..."
-	}
-	fmt.Printf("🔗 [Proxy] 获取直链成功: %s\n", preview)
+	fmt.Println("🔗 [Proxy] 获取直链成功")
 
 	// 3. 构造向 PikPak 的请求
-	outReq, err := http.NewRequest(r.Method, downloadLink, r.Body)
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, downloadLink, nil)
 	if err != nil {
 		http.Error(w, "Failed to create request", http.StatusInternalServerError)
 		fmt.Printf("❌ [Proxy] 创建请求失败: %v\n", err)
 		return
 	}
 
-	// 4. 🔥 核心：复制 Header (尤其是 Range) 🔥
-	// 播放器拖动进度条时，会发送 Range: bytes=1024- 这样的头
-	// 我们必须把它透传给 PikPak
-	for k, vv := range r.Header {
-		for _, v := range vv {
-			// Host 头不能复制，否则会 404
-			if !strings.EqualFold(k, "Host") {
-				outReq.Header.Add(k, v)
-			}
+	// 只传播放所需的条件请求头，避免把网页端的凭据转发到文件 CDN。
+	for _, key := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since"} {
+		if value := r.Header.Get(key); value != "" {
+			outReq.Header.Set(key, value)
 		}
 	}
 

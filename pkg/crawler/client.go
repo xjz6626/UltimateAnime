@@ -1,57 +1,91 @@
 package crawler
 
 import (
-	"encoding/json"
+	"encoding/base32"
+	"encoding/hex"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"math"
+	"net/url"
+	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-resty/resty/v2"
 )
 
 type Crawler struct {
-	client *resty.Client
-	ApiUrl string
+	client      *resty.Client
+	mikanClient *resty.Client
+	mikanURL    string
+	ApiUrl      string
+	mu          sync.RWMutex
 }
+
+const mikanSearchURL = "https://mikanani.me/RSS/Search"
 
 func NewCrawler(apiUrl, proxy string) *Crawler {
 	if apiUrl == "" {
 		apiUrl = "https://api.animes.garden/resources"
 	}
-	client := resty.New().
-		SetTimeout(15*time.Second).
+	client := resty.New().SetTimeout(15*time.Second).
 		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-
 	if proxy != "" {
 		client.SetProxy(proxy)
 	}
-
-	return &Crawler{
-		client: client,
-		ApiUrl: apiUrl,
+	mikanClient := resty.New().SetTimeout(15*time.Second).
+		SetHeader("User-Agent", "UltimateAnime/0.1")
+	if proxy != "" {
+		mikanClient.SetProxy(proxy)
 	}
+	return &Crawler{client: client, mikanClient: mikanClient, mikanURL: mikanSearchURL, ApiUrl: apiUrl}
 }
 
-// --- 数据结构 ---
+func (c *Crawler) SetAPIURL(apiURL string) {
+	if strings.TrimSpace(apiURL) == "" {
+		apiURL = "https://api.animes.garden/resources"
+	}
+	c.mu.Lock()
+	c.ApiUrl = apiURL
+	c.mu.Unlock()
+}
 
-// SearchResp 包装 API 返回的列表
 type SearchResp struct {
-	Resources []ResourceItem `json:"resources"`
+	Resources  []ResourceItem `json:"resources"`
+	Pagination struct {
+		Complete bool `json:"complete"`
+	} `json:"pagination"`
 }
 
 type ResourceItem struct {
 	Title     string      `json:"title"`
 	Magnet    string      `json:"magnet"`
-	Size      interface{} `json:"size"` // number (bytes) or string
+	Size      interface{} `json:"size"`
 	Type      string      `json:"type"`
 	Publisher struct {
 		Name string      `json:"name"`
 		Id   interface{} `json:"id"`
 	} `json:"publisher"`
-	CreatedAt string `json:"createdAt"` // JSON key is camelCase
+	CreatedAt string `json:"createdAt"`
+}
+
+type mikanFeed struct {
+	XMLName xml.Name `xml:"rss"`
+	Items   []struct {
+		Title     string `xml:"title"`
+		Enclosure struct {
+			URL string `xml:"url,attr"`
+		} `xml:"enclosure"`
+		Torrent struct {
+			ContentLength string `xml:"contentLength"`
+			PubDate       string `xml:"pubDate"`
+		} `xml:"torrent"`
+	} `xml:"channel>item"`
 }
 
 type TorrentItem struct {
@@ -62,9 +96,6 @@ type TorrentItem struct {
 	Source      string `json:"source"`
 }
 
-// --- 辅助函数 ---
-
-// parseSize 智能处理 Size 字段
 func parseSize(v interface{}) string {
 	if v == nil {
 		return "0 B"
@@ -76,291 +107,321 @@ func parseSize(v interface{}) string {
 	case int:
 		bytes = float64(val)
 	case string:
-		return val // 如果已经是字符串，直接返回
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+		if err != nil {
+			return val
+		}
+		bytes = parsed
 	default:
 		return fmt.Sprintf("%v", val)
 	}
-
-	// 转换为易读格式
-	const unit = 1024
-	if bytes < unit {
+	if bytes < 1024 {
 		return fmt.Sprintf("%.0f B", bytes)
 	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
+	div, exp := float64(1024), 0
+	for bytes/div >= 1024 && exp < 5 {
+		div *= 1024
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", bytes/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %cB", bytes/div, "KMGTPE"[exp])
 }
 
-// ParseEpisodeNumber 从标题提取集数
+var (
+	episodeRange    = regexp.MustCompile(`(?i)(?:\[|【|\b)\d{1,3}\s*[-~～]\s*\d{1,3}(?:\]|】|\b)`)
+	episodePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)\bS\d{1,2}E(\d{1,3}(?:\.\d)?)\b`),
+		regexp.MustCompile(`第\s*(\d{1,3}(?:\.\d)?)\s*[话話集]`),
+		regexp.MustCompile(`(?i)[\[【](\d{1,3}(?:\.\d)?)(?:v\d+)?[\]】]`),
+		regexp.MustCompile(`(?:^|\s)-\s*(\d{1,3}(?:\.\d)?)(?:\s|[\[【]|$)`),
+		regexp.MustCompile(`(?:^|[\s._-])(\d{1,3}(?:\.\d)?)(?:[\s._\-\]】]|$)`),
+	}
+	seasonPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`第\s*([一二三四五六七八九十\d]{1,3})\s*[季期]`),
+		regexp.MustCompile(`(?i)\bseason\s*0?(\d{1,2})\b`),
+		regexp.MustCompile(`(?i)\b0?(\d{1,2})(?:st|nd|rd|th)\s+season\b`),
+		regexp.MustCompile(`(?i)(?:^|[\s/\[【(])S0?(\d{1,2})(?:\b|E\d)`),
+	}
+	infoHashPattern = regexp.MustCompile(`(?i)^[0-9a-f]{40}$`)
+)
+
+// ParseEpisodeNumber rejects multi-episode packs so they cannot be selected automatically.
 func ParseEpisodeNumber(title string) float64 {
-	// 1. [数字] 或 【数字】 (排除年份和分辨率)
-	reBracket := regexp.MustCompile(`[\[【](\d{1,3}(?:\.\d{1,2})?)(?:v\d+)?[\]】]`)
-	matches := reBracket.FindAllStringSubmatch(title, -1)
-	for _, m := range matches {
-		if num, err := strconv.ParseFloat(m[1], 64); err == nil {
-			// 排除 1080, 720, 480, 2160, 20xx (年份)
-			if (num > 0 && num < 1900) && num != 1080 && num != 720 && num != 480 && num != 2160 {
-				// 检查是否包含 p/P (如 1080p)
-				if !regexp.MustCompile(`(?i)\d+p`).MatchString(m[0]) {
-					return num
-				}
+	if episodeRange.MatchString(title) || strings.Contains(title, "合集") || strings.Contains(strings.ToLower(title), "batch") {
+		return -1
+	}
+	for _, pattern := range episodePatterns {
+		for _, match := range pattern.FindAllStringSubmatch(title, -1) {
+			number, err := strconv.ParseFloat(match[1], 64)
+			if err == nil && number > 0 && number <= 200 {
+				return number
 			}
 		}
 	}
-
-	// 2. - 数字
-	reDash := regexp.MustCompile(`[-\-]\s*(\d{1,3}(?:\.\d)?)(?:\s|[\[【]|$)`)
-	if m := reDash.FindStringSubmatch(title); len(m) > 1 {
-		if num, err := strconv.ParseFloat(m[1], 64); err == nil {
-			return num
-		}
-	}
-
-	// 3. 第X话
-	reChinese := regexp.MustCompile(`第(\d{1,3}(?:\.\d)?)[话話集]`)
-	if m := reChinese.FindStringSubmatch(title); len(m) > 1 {
-		if num, err := strconv.ParseFloat(m[1], 64); err == nil {
-			return num
-		}
-	}
-
-	// 4. 简单匹配 (作为最后的手段)
-	reSimple := regexp.MustCompile(`[\s\.\-_](\d{1,3}(?:\.\d)?)[\s\.\-_\]]`)
-	matchesSimple := reSimple.FindAllStringSubmatch(title, -1)
-	var candidates []float64
-	for _, m := range matchesSimple {
-		if num, err := strconv.ParseFloat(m[1], 64); err == nil {
-			if num > 0 && num < 1000 && num != 720 && num != 1080 {
-				candidates = append(candidates, num)
-			}
-		}
-	}
-	if len(candidates) > 0 {
-		// 返回最后一个匹配项 (通常集数在标题后部)
-		return candidates[len(candidates)-1]
-	}
-
 	return -1
 }
 
-// --- 方法实现 ---
-
-// SearchResource 搜索资源
-func (c *Crawler) SearchResource(keyword string) ([]TorrentItem, error) {
-	// 使用 GET 请求
-	var respData SearchResp
-
-	// 构造 JSON 数组字符串作为 search 参数
-	// API 似乎支持 search=["keyword"] 格式
-	searchParam := fmt.Sprintf("[\"%s\"]", keyword)
-
-	_, err := c.client.R().
-		SetQueryParams(map[string]string{
-			"search":   searchParam,
-			"pageSize": "100",
-			"page":     "1",
-		}).
-		SetResult(&respData).
-		Get(c.ApiUrl)
-
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-
-	var items []TorrentItem
-	for _, res := range respData.Resources {
-		pubDate := res.CreatedAt
-		if t, err := time.Parse(time.RFC3339, res.CreatedAt); err == nil {
-			pubDate = t.Format("2006-01-02 15:04")
+func seasonNumber(title string) (int, bool) {
+	for _, pattern := range seasonPatterns {
+		match := pattern.FindStringSubmatch(title)
+		if len(match) < 2 {
+			continue
 		}
-
-		items = append(items, TorrentItem{
-			Title:       res.Title,
-			Magnet:      res.Magnet,
-			Size:        parseSize(res.Size),
-			PublishDate: pubDate,
-			Source:      res.Publisher.Name,
-		})
+		if number, err := strconv.Atoi(match[1]); err == nil && number > 0 {
+			return number, true
+		}
+		chinese := map[rune]int{'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+		runes := []rune(match[1])
+		if len(runes) == 1 && runes[0] == '十' {
+			return 10, true
+		}
+		if len(runes) == 1 && chinese[runes[0]] > 0 {
+			return chinese[runes[0]], true
+		}
+		if len(runes) == 2 && runes[0] == '十' && chinese[runes[1]] > 0 {
+			return 10 + chinese[runes[1]], true
+		}
 	}
+	return 0, false
+}
 
+func (c *Crawler) fetchResources(terms []string) ([]ResourceItem, error) {
+	if len(terms) == 0 || strings.TrimSpace(terms[0]) == "" {
+		return nil, fmt.Errorf("搜索关键词不能为空")
+	}
+	// AnimeGarden reads each search term from its own search= parameter.
+	params := url.Values{"search": terms, "pageSize": {"100"}}
+	c.mu.RLock()
+	apiURL := c.ApiUrl
+	c.mu.RUnlock()
+	var all []ResourceItem
+	for page := 1; page <= 3; page++ {
+		params.Set("page", strconv.Itoa(page))
+		var result SearchResp
+		response, err := c.client.R().SetQueryParamsFromValues(params).SetResult(&result).Get(apiURL)
+		if err != nil {
+			return nil, fmt.Errorf("搜索请求失败: %w", err)
+		}
+		if response.IsError() {
+			return nil, fmt.Errorf("搜索接口返回 HTTP %d", response.StatusCode())
+		}
+		all = append(all, result.Resources...)
+		if result.Pagination.Complete || len(result.Resources) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
+func mikanInfoHash(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return ""
+	}
+	filename := path.Base(parsed.Path)
+	if !strings.HasSuffix(strings.ToLower(filename), ".torrent") {
+		return ""
+	}
+	hash := filename[:len(filename)-len(".torrent")]
+	if !infoHashPattern.MatchString(hash) {
+		return ""
+	}
+	return strings.ToLower(hash)
+}
+
+func (c *Crawler) fetchMikanResources(keyword string) ([]ResourceItem, error) {
+	if c.mikanURL == "" {
+		return nil, nil
+	}
+	response, err := c.mikanClient.R().SetQueryParam("searchstr", keyword).Get(c.mikanURL)
+	if err != nil {
+		return nil, fmt.Errorf("蜜柑计划搜索请求失败: %w", err)
+	}
+	if response.IsError() {
+		return nil, fmt.Errorf("蜜柑计划搜索接口返回 HTTP %d", response.StatusCode())
+	}
+	if len(response.Body()) > 2<<20 {
+		return nil, fmt.Errorf("蜜柑计划 RSS 响应过大")
+	}
+	var feed mikanFeed
+	if err := xml.Unmarshal(response.Body(), &feed); err != nil {
+		return nil, fmt.Errorf("解析蜜柑计划 RSS 失败: %w", err)
+	}
+	items := make([]ResourceItem, 0, len(feed.Items))
+	for _, item := range feed.Items {
+		hash := mikanInfoHash(item.Enclosure.URL)
+		if hash == "" || item.Title == "" {
+			continue
+		}
+		resource := ResourceItem{
+			Title:     item.Title,
+			Magnet:    "magnet:?xt=urn:btih:" + hash,
+			Size:      item.Torrent.ContentLength,
+			CreatedAt: item.Torrent.PubDate,
+		}
+		resource.Publisher.Name = "蜜柑计划"
+		items = append(items, resource)
+	}
 	return items, nil
 }
 
-// SearchEpisode 搜索特定集数
-func (c *Crawler) SearchEpisode(keywords []string, episodeNum float64) (*TorrentItem, error) {
-	// 1. 搜索所有相关资源
-	var respData SearchResp
-
-	// 构造 search 参数 (JSON 数组)
-	// 优化：添加集数关键字以缩小搜索范围
-	searchTerms := []string{}
-	if len(keywords) > 0 {
-		searchTerms = append(searchTerms, keywords[0])
+func (c *Crawler) fetchAll(animeTerms []string, mikanQuery string) ([]ResourceItem, error) {
+	var animeResources, mikanResources []ResourceItem
+	var animeErr, mikanErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		animeResources, animeErr = c.fetchResources(animeTerms)
+	}()
+	if c.mikanURL != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mikanResources, mikanErr = c.fetchMikanResources(mikanQuery)
+		}()
 	}
-
-	// 尝试添加集数作为关键词
-	// 策略：如果是整数，尝试添加 "01" 这种格式 (绝大多数番剧都是 01, 02...)
-	// "1" 在 1080p, 2023 中太常见，过滤效果差，且 API 可能是模糊匹配。
-	if episodeNum == float64(int(episodeNum)) {
-		searchTerms = append(searchTerms, fmt.Sprintf("%02d", int(episodeNum)))
-	} else {
-		searchTerms = append(searchTerms, fmt.Sprintf("%g", episodeNum))
+	wg.Wait()
+	resources := append(animeResources, mikanResources...)
+	if animeErr != nil {
+		animeErr = fmt.Errorf("AnimeGarden: %w", animeErr)
 	}
-
-	searchParamBytes, _ := json.Marshal(searchTerms)
-	searchParam := string(searchParamBytes)
-
-	fmt.Printf("🔍 [Crawler] Searching: %s, Target Ep: %.1f\n", searchParam, episodeNum)
-
-	_, err := c.client.R().
-		SetQueryParams(map[string]string{
-			"search":   searchParam,
-			"pageSize": "100",
-			"page":     "1",
-		}).
-		SetResult(&respData).
-		Get(c.ApiUrl)
-
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-
-	fmt.Printf("🔍 [Crawler] Found %d items\n", len(respData.Resources))
-
-	// 2. 筛选特定集数
-	var candidates []ResourceItem
-	for _, res := range respData.Resources {
-		ep := ParseEpisodeNumber(res.Title)
-		fmt.Printf("  - Check: [%.1f] %s\n", ep, res.Title)
-
-		// 使用 epsilon 比较浮点数，防止精度问题
-		if math.Abs(ep-episodeNum) < 0.1 {
-			candidates = append(candidates, res)
-		}
-	}
-
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("episode %.1f not found", episodeNum)
-	}
-
-	// 3. 优选最佳资源 (优先简中 > 繁中 > 其他，排除纯英)
-	var bestRes ResourceItem
-	bestScore := -10000
-
-	for _, res := range candidates {
-		score := 0
-		upperTitle := strings.ToUpper(res.Title)
-
-		// 简中权重最高
-		if strings.Contains(upperTitle, "CHS") || strings.Contains(upperTitle, "GB") || strings.Contains(upperTitle, "简体") || strings.Contains(upperTitle, "简中") {
-			score += 100
-		} else if strings.Contains(upperTitle, "CHT") || strings.Contains(upperTitle, "BIG5") || strings.Contains(upperTitle, "繁体") || strings.Contains(upperTitle, "繁中") || strings.Contains(upperTitle, "TC") {
-			// 繁中次之
-			score += 50
-		} else if strings.Contains(upperTitle, "CN") || strings.Contains(upperTitle, "ZH") {
-			// 通用中文
-			score += 10
-		}
-
-		// 英文降权
-		if strings.Contains(upperTitle, "ENG") || strings.Contains(upperTitle, "ENGLISH") {
-			score -= 10
-		}
-
-		// 优先选择 1080P
-		if strings.Contains(upperTitle, "1080") {
-			score += 5
-		}
-
-		fmt.Printf("  - Candidate: %s (Score: %d)\n", res.Title, score)
-
-		if score > bestScore {
-			bestScore = score
-			bestRes = res
-		}
-	}
-
-	fmt.Printf("  ✅ Best Match: %s\n", bestRes.Title)
-	pubDate := bestRes.CreatedAt
-	if t, err := time.Parse(time.RFC3339, bestRes.CreatedAt); err == nil {
-		pubDate = t.Format("2006-01-02 15:04")
-	}
-
-	return &TorrentItem{
-		Title:       bestRes.Title,
-		Magnet:      bestRes.Magnet,
-		Size:        parseSize(bestRes.Size),
-		PublishDate: pubDate,
-		Source:      bestRes.Publisher.Name,
-	}, nil
+	return resources, errors.Join(animeErr, mikanErr)
 }
 
-// SearchEpisodeList 搜索集数磁力链接，返回所有候选列表（不自动选择）
-func (c *Crawler) SearchEpisodeList(keywords []string, episodeNum float64) ([]TorrentItem, error) {
-	var respData SearchResp
-
-	// 1. 发送搜索请求
-	var searchTerms []string
-	if len(keywords) > 0 {
-		searchTerms = append(searchTerms, keywords[0])
+func magnetKey(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "magnet" {
+		return raw
 	}
-
-	// 添加集数
-	if episodeNum == float64(int(episodeNum)) {
-		searchTerms = append(searchTerms, fmt.Sprintf("%02d", int(episodeNum)))
-	} else {
-		searchTerms = append(searchTerms, fmt.Sprintf("%g", episodeNum))
-	}
-
-	searchParamBytes, _ := json.Marshal(searchTerms)
-	searchParam := string(searchParamBytes)
-
-	fmt.Printf("🔍 [Crawler] Searching List: %s, Target Ep: %.1f\n", searchParam, episodeNum)
-
-	_, err := c.client.R().
-		SetQueryParams(map[string]string{
-			"search":   searchParam,
-			"pageSize": "100",
-			"page":     "1",
-		}).
-		SetResult(&respData).
-		Get(c.ApiUrl)
-
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %v", err)
-	}
-
-	fmt.Printf("🔍 [Crawler] Found %d items\n", len(respData.Resources))
-
-	// 2. 筛选特定集数并转换为 TorrentItem
-	var results []TorrentItem
-	for _, res := range respData.Resources {
-		ep := ParseEpisodeNumber(res.Title)
-
-		// 使用 epsilon 比较浮点数
-		if math.Abs(ep-episodeNum) < 0.1 {
-			pubDate := res.CreatedAt
-			if t, err := time.Parse(time.RFC3339, res.CreatedAt); err == nil {
-				pubDate = t.Format("2006-01-02 15:04")
+	for _, xt := range parsed.Query()["xt"] {
+		if len(xt) < len("urn:btih:") || !strings.EqualFold(xt[:len("urn:btih:")], "urn:btih:") {
+			continue
+		}
+		hash := xt[len("urn:btih:"):]
+		if infoHashPattern.MatchString(hash) {
+			return strings.ToLower(hash)
+		}
+		if len(hash) == 32 {
+			decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(hash))
+			if err == nil && len(decoded) == 20 {
+				return hex.EncodeToString(decoded)
 			}
-
-			results = append(results, TorrentItem{
-				Title:       res.Title,
-				Magnet:      res.Magnet,
-				Size:        parseSize(res.Size),
-				PublishDate: pubDate,
-				Source:      res.Publisher.Name,
-			})
 		}
 	}
+	return raw
+}
 
-	if len(results) == 0 {
-		return nil, fmt.Errorf("episode %.1f not found", episodeNum)
+func toTorrentItem(resource ResourceItem) TorrentItem {
+	date := resource.CreatedAt
+	if parsed, err := time.Parse(time.RFC3339, date); err == nil {
+		date = parsed.Format("2006-01-02 15:04")
+	} else if parsed, err := time.Parse("2006-01-02T15:04:05", date); err == nil {
+		date = parsed.Format("2006-01-02 15:04")
 	}
+	return TorrentItem{
+		Title: resource.Title, Magnet: resource.Magnet,
+		Size: parseSize(resource.Size), PublishDate: date, Source: resource.Publisher.Name,
+	}
+}
 
-	fmt.Printf("  ✅ Found %d candidates\n", len(results))
-	return results, nil
+func (c *Crawler) SearchResource(keyword string) ([]TorrentItem, error) {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return nil, fmt.Errorf("搜索关键词不能为空")
+	}
+	resources, err := c.fetchAll([]string{keyword}, keyword)
+	if err != nil && len(resources) == 0 {
+		return nil, err
+	}
+	items := make([]TorrentItem, 0, len(resources))
+	seen := make(map[string]bool)
+	for _, resource := range resources {
+		key := magnetKey(resource.Magnet)
+		if resource.Magnet == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		items = append(items, toTorrentItem(resource))
+	}
+	return items, nil
+}
+
+func episodeSearchTerm(episode float64) string {
+	if episode == math.Trunc(episode) {
+		return fmt.Sprintf("%02d", int(episode))
+	}
+	return strconv.FormatFloat(episode, 'f', -1, 64)
+}
+
+func scoreTitle(title string) int {
+	upper := strings.ToUpper(title)
+	score := 0
+	if strings.Contains(upper, "CHS") || strings.Contains(upper, "简体") || strings.Contains(upper, "简中") || strings.Contains(upper, "GB") {
+		score += 100
+	} else if strings.Contains(upper, "CHT") || strings.Contains(upper, "繁体") || strings.Contains(upper, "繁中") || strings.Contains(upper, "BIG5") {
+		score += 50
+	}
+	if strings.Contains(upper, "1080P") {
+		score += 5
+	}
+	if strings.Contains(upper, "ENG") || strings.Contains(upper, "ENGLISH") {
+		score -= 10
+	}
+	return score
+}
+
+func matchingEpisodes(resources []ResourceItem, episode float64, name string) []TorrentItem {
+	items := make([]TorrentItem, 0)
+	seen := make(map[string]bool)
+	wantSeason, explicitSeason := seasonNumber(name)
+	if !explicitSeason {
+		wantSeason = 1
+	}
+	for _, resource := range resources {
+		key := magnetKey(resource.Magnet)
+		if resource.Magnet == "" || seen[key] || math.Abs(ParseEpisodeNumber(resource.Title)-episode) >= 0.01 {
+			continue
+		}
+		season, hasSeason := seasonNumber(resource.Title)
+		if (hasSeason && season != wantSeason) || (explicitSeason && !hasSeason) {
+			continue
+		}
+		seen[key] = true
+		items = append(items, toTorrentItem(resource))
+	}
+	sort.SliceStable(items, func(i, j int) bool { return scoreTitle(items[i].Title) > scoreTitle(items[j].Title) })
+	return items
+}
+
+func (c *Crawler) SearchEpisodeList(keywords []string, episode float64) ([]TorrentItem, error) {
+	if len(keywords) == 0 || episode <= 0 {
+		return nil, fmt.Errorf("缺少番剧名称或集数")
+	}
+	name := strings.TrimSpace(keywords[0])
+	if name == "" {
+		return nil, fmt.Errorf("缺少番剧名称或集数")
+	}
+	resources, firstErr := c.fetchAll([]string{name, episodeSearchTerm(episode)}, name+" "+episodeSearchTerm(episode))
+	items := matchingEpisodes(resources, episode, name)
+	if len(items) > 0 {
+		return items, nil
+	}
+	// Publishers may use 1 instead of 01; retry by title and filter locally.
+	resources, fallbackErr := c.fetchAll([]string{name}, name)
+	items = matchingEpisodes(resources, episode, name)
+	if len(items) > 0 {
+		return items, nil
+	}
+	return nil, errors.Join(firstErr, fallbackErr)
+}
+
+func (c *Crawler) SearchEpisode(keywords []string, episode float64) (*TorrentItem, error) {
+	items, err := c.SearchEpisodeList(keywords, episode)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("未找到第 %g 集的磁力链接", episode)
+	}
+	return &items[0], nil
 }

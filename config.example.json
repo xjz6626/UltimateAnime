@@ -6,12 +6,14 @@
       "your_email@example.com"
     ],
     "pikpak_password": "your_password",
-    "auto_login": true,
     "proxy": "",
     "torrent_api_url": "https://api.animes.garden/resources"
   },
   "local_storage": {
     "anime_dir": "Downloads"
+  },
+  "torrent_searcher": {
+    "auto_select_magnet": false
   },
   "player": {
     "mpv_path": "",

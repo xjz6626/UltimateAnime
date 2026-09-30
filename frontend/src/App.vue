@@ -1,6 +1,6 @@
 <template>
-  <div class="flex h-screen bg-gray-900 text-white font-sans">
-    <div class="w-64 bg-gray-800 flex flex-col border-r border-gray-700">
+  <div class="flex h-screen h-[100dvh] min-w-0 bg-gray-900 text-white font-sans" :class="isWebMode() ? 'flex-col lg:flex-row' : 'flex-row'">
+    <div class="w-64 shrink-0 flex-col border-r border-gray-700 bg-gray-800" :class="isWebMode() ? 'hidden lg:flex' : 'flex'">
       <div class="p-6 flex items-center justify-center border-b border-gray-700/50">
         <div class="w-8 h-8 bg-pink-600 rounded-lg flex items-center justify-center mr-3 shadow-lg shadow-pink-500/20">
           <span class="text-white font-bold text-lg">U</span>
@@ -32,30 +32,48 @@
           <div class="w-2 h-2 rounded-full" :class="pikpakStatus === 'Success' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]' : 'bg-red-500'"></div>
           <div class="flex-1 min-w-0">
             <p class="text-xs text-gray-400 font-medium">PikPak 状态</p>
-            <p class="text-xs text-gray-300 truncate" :title="pikpakStatus">{{ pikpakStatus === 'Success' ? '已连接' : '未连接' }}</p>
+            <p class="text-xs text-gray-300 truncate" :title="pikpakStatus">{{ pikpakStatus === 'Success' ? '已连接' : '下载时连接' }}</p>
           </div>
         </div>
       </div>
     </div>
 
-    <div class="flex-1 overflow-y-auto bg-gray-900">
-      <div v-if="isWebMode() && pikpakStatus !== 'Success'" class="bg-amber-900/50 border-b border-amber-700 px-6 py-3 text-sm text-amber-100">
-        PikPak 未连接。请在家里的桌面端登录，或开启自动登录后重启应用。
+    <header v-if="isWebMode()" class="mobile-header flex shrink-0 items-center justify-between gap-3 border-b border-gray-700 bg-gray-800 px-4 py-3 lg:hidden">
+      <div class="flex min-w-0 items-center gap-2.5">
+        <div class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-pink-600 font-bold">U</div>
+        <span class="truncate font-bold">Ultimate Anime</span>
       </div>
+      <span class="shrink-0 text-xs" :class="pikpakStatus === 'Success' ? 'text-green-400' : 'text-gray-400'">
+        <span aria-hidden="true">●</span> {{ pikpakStatus === 'Success' ? '已连接' : '下载时连接' }}
+      </span>
+    </header>
+
+    <main class="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain bg-gray-900">
       <router-view v-slot="{ Component }">
         <transition name="fade" mode="out-in">
           <component :is="Component" />
         </transition>
       </router-view>
-    </div>
+    </main>
+
+    <nav v-if="isWebMode()" class="mobile-nav grid shrink-0 grid-cols-3 border-t border-gray-700 bg-gray-800 lg:hidden" aria-label="主导航">
+      <router-link to="/" class="mobile-nav-item" active-class="active">
+        <span aria-hidden="true" class="text-xl">📺</span><span>追番</span>
+      </router-link>
+      <router-link to="/discovery" class="mobile-nav-item" active-class="active">
+        <span aria-hidden="true" class="text-xl">📅</span><span>新番</span>
+      </router-link>
+      <router-link to="/logs" class="mobile-nav-item" active-class="active">
+        <span aria-hidden="true" class="text-xl">📜</span><span>日志</span>
+      </router-link>
+    </nav>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { EventsOn, GetPikPakStatus, isWebMode } from './api'
 
-// 这里将来调用后端的 AutoLogin
 const pikpakStatus = ref("未登录") 
 
 const checkStatus = async () => {
@@ -67,14 +85,16 @@ const checkStatus = async () => {
   }
 }
 
+let stopStatusEvents;
 onMounted(() => {
     checkStatus();
     
     // 监听状态变化
-    EventsOn("pikpak-status", (status) => {
+    stopStatusEvents = EventsOn("pikpak-status", (status) => {
         pikpakStatus.value = status;
     });
 })
+onUnmounted(() => stopStatusEvents?.())
 </script>
 
 <style>
@@ -97,6 +117,21 @@ onMounted(() => {
   font-weight: bold;
   box-shadow: 0 4px 6px rgba(0,0,0,0.3);
 }
+
+.mobile-header { padding-top: max(0.75rem, env(safe-area-inset-top)); }
+.mobile-nav { padding-bottom: env(safe-area-inset-bottom); }
+.mobile-nav-item {
+  display: flex;
+  min-height: 3.5rem;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.125rem;
+  color: #9ca3af;
+  font-size: 0.75rem;
+  text-decoration: none;
+}
+.mobile-nav-item.active { color: #f9a8d4; font-weight: bold; }
 
 /* 页面切换动画 */
 .fade-enter-active, .fade-leave-active {

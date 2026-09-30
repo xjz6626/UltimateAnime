@@ -5,8 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"UltimateAnime/pkg/config"
 )
 
 func TestWebHandlerServesVueAndLimitsRPC(t *testing.T) {
@@ -49,8 +52,8 @@ func TestWebHandlerServesVueAndLimitsRPC(t *testing.T) {
 		t.Fatalf("cross-origin RPC should be blocked: %d", foreign.Code)
 	}
 	noLogin := call("http://127.0.0.1:54322", `{"method":"DownloadEpisode","args":[42,1,"magnet:?xt=urn:btih:test"]}`)
-	if noLogin.Code != http.StatusBadRequest {
-		t.Fatalf("download without login should fail: %d", noLogin.Code)
+	if noLogin.Code != http.StatusOK || !strings.Contains(noLogin.Body.String(), "配置未初始化") {
+		t.Fatalf("download should reach lazy login path: %d %q", noLogin.Code, noLogin.Body.String())
 	}
 	forwarded := httptest.NewRequest(http.MethodPost, "/api/rpc", strings.NewReader(`{"method":"GetPikPakStatus","args":[]}`))
 	forwarded.Host = "127.0.0.1:54322"
@@ -83,6 +86,32 @@ func TestWebEventHub(t *testing.T) {
 		t.Fatal("event was not delivered")
 	}
 	unsubscribe()
+}
+
+func TestWebRPCExposesAutoSelectModeWithoutFullConfig(t *testing.T) {
+	dist, err := fs.Sub(assets, "frontend/dist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := config.NewDefaultConfig()
+	settings.TorrentSearcher.AutoSelectMagnet = true
+	a := &App{configMgr: &config.Manager{ConfigPath: filepath.Join(t.TempDir(), "config.json"), Data: settings}}
+	handler := a.webHandler(dist)
+	call := func(method string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/api/rpc", strings.NewReader(`{"method":"`+method+`","args":[]}`))
+		request.Host = "127.0.0.1:54322"
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	mode := call("GetAutoSelectMagnet")
+	if mode.Code != http.StatusOK || !strings.Contains(mode.Body.String(), `"result":true`) {
+		t.Fatalf("selection mode RPC: %d %q", mode.Code, mode.Body.String())
+	}
+	if response := call("GetAppConfig"); response.Code != http.StatusBadRequest {
+		t.Fatalf("full config should stay unavailable: %d", response.Code)
+	}
 }
 
 func TestWebImageURLAllowlist(t *testing.T) {

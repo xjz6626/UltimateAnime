@@ -87,7 +87,10 @@ type Subject struct {
 		Wish    int `json:"wish"`    // 想看
 		Collect int `json:"collect"` // 看过
 	} `json:"collection"`
-	Rank int `json:"rank"`
+	Rank                    int   `json:"rank"`
+	NextAiringAt            int64 `json:"next_airing_at,omitempty"`
+	FollowedContinuation    bool  `json:"followed_continuation,omitempty"`
+	NextQuarterContinuation bool  `json:"next_quarter_continuation,omitempty"`
 }
 
 // SearchResult 搜索结果
@@ -114,6 +117,7 @@ type SubjectDetail struct {
 	Summary       string `json:"summary"`
 	Date          string `json:"date"`           // 放送开始日期
 	TotalEpisodes int    `json:"total_episodes"` // 总集数
+	Eps           int    `json:"eps"`            // 计划话数
 	Images        struct {
 		Large  string `json:"large"`
 		Common string `json:"common"`
@@ -143,12 +147,15 @@ type Episode struct {
 func (b *BangumiClient) GetCalendar() ([]CalendarItem, error) {
 	var result []CalendarItem
 	// API: GET /calendar
-	_, err := b.client.R().
+	response, err := b.client.R().
 		SetResult(&result).
 		Get("https://api.bgm.tv/calendar")
 
 	if err != nil {
 		return nil, fmt.Errorf("请求 Bangumi 日历失败: %v", err)
+	}
+	if response.IsError() || len(result) == 0 {
+		return nil, fmt.Errorf("Bangumi 日历接口返回 HTTP %d 或空日历", response.StatusCode())
 	}
 	return result, nil
 }
@@ -228,12 +235,15 @@ func (b *BangumiClient) UpdateCollectionStatus(subjectID int, status int) error 
 func (b *BangumiClient) GetSubjectDetail(subjectID int) (*SubjectDetail, error) {
 	var result SubjectDetail
 	// API: GET /v0/subjects/{subject_id}
-	_, err := b.client.R().
+	response, err := b.client.R().
 		SetResult(&result).
 		Get(fmt.Sprintf("https://api.bgm.tv/v0/subjects/%d", subjectID))
 
 	if err != nil {
 		return nil, fmt.Errorf("获取番剧详情失败: %v", err)
+	}
+	if response.IsError() || result.ID == 0 {
+		return nil, fmt.Errorf("Bangumi 番剧详情接口返回 HTTP %d", response.StatusCode())
 	}
 	return &result, nil
 }
@@ -241,12 +251,11 @@ func (b *BangumiClient) GetSubjectDetail(subjectID int) (*SubjectDetail, error) 
 // GetSubjectEpisodes 获取番剧剧集列表
 func (b *BangumiClient) GetSubjectEpisodes(subjectID int) ([]Episode, error) {
 	var result struct {
-		Data  []Episode `json:"data"`
-		Total int       `json:"total"`
+		Data []Episode `json:"data"`
 	}
 	// API: GET /v0/episodes?subject_id={id}&type=0 (只获取本篇)
 	// 默认 limit=100，对于大多数番剧够用了
-	_, err := b.client.R().
+	response, err := b.client.R().
 		SetResult(&result).
 		SetQueryParam("subject_id", fmt.Sprintf("%d", subjectID)).
 		SetQueryParam("type", "0"). // 0 = 本篇
@@ -255,6 +264,9 @@ func (b *BangumiClient) GetSubjectEpisodes(subjectID int) ([]Episode, error) {
 
 	if err != nil {
 		return nil, fmt.Errorf("获取剧集列表失败: %v", err)
+	}
+	if response.IsError() {
+		return nil, fmt.Errorf("Bangumi 剧集接口返回 HTTP %d", response.StatusCode())
 	}
 	return result.Data, nil
 }
