@@ -1,8 +1,10 @@
 package crawler
 
 import (
+	"context"
 	"encoding/base32"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -217,4 +219,112 @@ func TestSearchEpisodeUsesMikanWhenPrimaryFails(t *testing.T) {
 	if err != nil || item == nil || item.Source != "蜜柑计划" {
 		t.Fatalf("item=%+v, err=%v", item, err)
 	}
+}
+
+func TestSearchEpisodeUsesMikanWhenAnimeGardenTimesOut(t *testing.T) {
+	const hash = "abcdef0123456789abcdef0123456789abcdef01"
+	crawler := NewCrawler("https://example.test/resources", "")
+	crawler.client.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}))
+	crawler.mikanClient.SetTransport(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := `<rss><channel><item><title>番剧 - 01</title><enclosure url="https://mikanani.me/Download/` + hash + `.torrent"/></item></channel></rss>`
+		return xmlResponse(request, body), nil
+	}))
+
+	items, err := crawler.SearchEpisodeList([]string{"番剧"}, 1)
+	if err != nil || len(items) != 1 || items[0].Source != "蜜柑计划" {
+		t.Fatalf("items=%+v, err=%v", items, err)
+	}
+}
+
+func TestSearchEpisodeMikanTimeoutDoesNotHideEmptyAnimeGardenResult(t *testing.T) {
+	crawler := NewCrawler("https://example.test/resources", "")
+	crawler.client.SetTransport(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return jsonResponse(request, `{"resources":[]}`), nil
+	}))
+	mikanRequests := 0
+	crawler.mikanClient.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		mikanRequests++
+		return nil, context.DeadlineExceeded
+	}))
+
+	items, err := crawler.SearchEpisodeList([]string{"番剧"}, 1)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("items=%+v, err=%v", items, err)
+	}
+	if mikanRequests != 1 {
+		t.Fatalf("mikan requests=%d, want 1", mikanRequests)
+	}
+}
+
+func TestSearchEpisodeFallsBackToAnimeGardenAfterMikanTimeout(t *testing.T) {
+	crawler := NewCrawler("https://example.test/resources", "")
+	crawler.client.SetTransport(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if len(request.URL.Query()["search"]) == 1 {
+			return jsonResponse(request, `{"resources":[{"title":"番剧 - 01 [CHS]","magnet":"magnet:?xt=urn:btih:one"}]}`), nil
+		}
+		return jsonResponse(request, `{"resources":[]}`), nil
+	}))
+	mikanRequests := 0
+	crawler.mikanClient.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		mikanRequests++
+		return nil, context.DeadlineExceeded
+	}))
+
+	items, err := crawler.SearchEpisodeList([]string{"番剧"}, 1)
+	if err != nil || len(items) != 1 || items[0].Magnet != "magnet:?xt=urn:btih:one" {
+		t.Fatalf("items=%+v, err=%v", items, err)
+	}
+	if mikanRequests != 1 {
+		t.Fatalf("mikan requests=%d, want 1", mikanRequests)
+	}
+}
+
+func TestSearchResourceKeepsEarlierPageWhenLaterPageAndMikanFail(t *testing.T) {
+	crawler := NewCrawler("https://example.test/resources", "")
+	crawler.client.SetTransport(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Query().Get("page") != "1" {
+			return nil, context.DeadlineExceeded
+		}
+		result := SearchResp{Resources: make([]ResourceItem, 100)}
+		for i := range result.Resources {
+			result.Resources[i].Title = fmt.Sprintf("番剧 - %02d", i+1)
+			result.Resources[i].Magnet = fmt.Sprintf("magnet:?xt=urn:btih:%040d", i+1)
+		}
+		body, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jsonResponse(request, string(body)), nil
+	}))
+	crawler.mikanClient.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}))
+
+	items, err := crawler.SearchResource("番剧")
+	if err != nil || len(items) != 100 {
+		t.Fatalf("items=%d, err=%v", len(items), err)
+	}
+}
+
+func TestSearchResourceReportsErrorWhenBothSourcesFail(t *testing.T) {
+	crawler := NewCrawler("https://example.test/resources", "")
+	crawler.client.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}))
+	crawler.mikanClient.SetTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}))
+
+	_, err := crawler.SearchResource("番剧")
+	if err == nil || !strings.Contains(err.Error(), "AnimeGarden") || !strings.Contains(err.Error(), "蜜柑计划") {
+		t.Fatalf("expected both source errors, got %v", err)
+	}
+}
+
+func jsonResponse(request *http.Request, body string) *http.Response {
+	header := make(http.Header)
+	header.Set("Content-Type", "application/json")
+	return &http.Response{StatusCode: 200, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: request}
 }

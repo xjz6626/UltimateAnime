@@ -199,9 +199,15 @@ func (c *Crawler) fetchResources(terms []string) ([]ResourceItem, error) {
 		var result SearchResp
 		response, err := c.client.R().SetQueryParamsFromValues(params).SetResult(&result).Get(apiURL)
 		if err != nil {
+			if len(all) > 0 {
+				return all, nil
+			}
 			return nil, fmt.Errorf("搜索请求失败: %w", err)
 		}
 		if response.IsError() {
+			if len(all) > 0 {
+				return all, nil
+			}
 			return nil, fmt.Errorf("搜索接口返回 HTTP %d", response.StatusCode())
 		}
 		all = append(all, result.Resources...)
@@ -264,16 +270,17 @@ func (c *Crawler) fetchMikanResources(keyword string) ([]ResourceItem, error) {
 	return items, nil
 }
 
-func (c *Crawler) fetchAll(animeTerms []string, mikanQuery string) ([]ResourceItem, error) {
+func (c *Crawler) fetchAll(animeTerms []string, mikanQuery string) ([]ResourceItem, error, error) {
 	var animeResources, mikanResources []ResourceItem
 	var animeErr, mikanErr error
 	var wg sync.WaitGroup
+	searchMikan := c.mikanURL != "" && mikanQuery != ""
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		animeResources, animeErr = c.fetchResources(animeTerms)
 	}()
-	if c.mikanURL != "" {
+	if searchMikan {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -285,7 +292,11 @@ func (c *Crawler) fetchAll(animeTerms []string, mikanQuery string) ([]ResourceIt
 	if animeErr != nil {
 		animeErr = fmt.Errorf("AnimeGarden: %w", animeErr)
 	}
-	return resources, errors.Join(animeErr, mikanErr)
+	// One reachable source is enough to make the search usable, even if it is empty.
+	if animeErr == nil || (searchMikan && mikanErr == nil) {
+		return resources, nil, mikanErr
+	}
+	return resources, errors.Join(animeErr, mikanErr), mikanErr
 }
 
 func magnetKey(raw string) string {
@@ -329,7 +340,7 @@ func (c *Crawler) SearchResource(keyword string) ([]TorrentItem, error) {
 	if keyword == "" {
 		return nil, fmt.Errorf("搜索关键词不能为空")
 	}
-	resources, err := c.fetchAll([]string{keyword}, keyword)
+	resources, err, _ := c.fetchAll([]string{keyword}, keyword)
 	if err != nil && len(resources) == 0 {
 		return nil, err
 	}
@@ -401,16 +412,24 @@ func (c *Crawler) SearchEpisodeList(keywords []string, episode float64) ([]Torre
 	if name == "" {
 		return nil, fmt.Errorf("缺少番剧名称或集数")
 	}
-	resources, firstErr := c.fetchAll([]string{name, episodeSearchTerm(episode)}, name+" "+episodeSearchTerm(episode))
+	resources, firstErr, mikanErr := c.fetchAll([]string{name, episodeSearchTerm(episode)}, name+" "+episodeSearchTerm(episode))
 	items := matchingEpisodes(resources, episode, name)
 	if len(items) > 0 {
 		return items, nil
 	}
 	// Publishers may use 1 instead of 01; retry by title and filter locally.
-	resources, fallbackErr := c.fetchAll([]string{name}, name)
+	fallbackMikanQuery := name
+	if mikanErr != nil {
+		// A failed source should not add another full timeout to the title fallback.
+		fallbackMikanQuery = ""
+	}
+	resources, fallbackErr, _ := c.fetchAll([]string{name}, fallbackMikanQuery)
 	items = matchingEpisodes(resources, episode, name)
 	if len(items) > 0 {
 		return items, nil
+	}
+	if firstErr == nil || fallbackErr == nil {
+		return nil, nil
 	}
 	return nil, errors.Join(firstErr, fallbackErr)
 }
