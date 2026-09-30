@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -30,8 +31,10 @@ type App struct {
 	crawler             *crawler.Crawler
 	imgProxy            *imgproxy.Proxy     // 图片代理服务
 	logHistory          []map[string]string // 日志历史
-	currentAccountIndex int                 // 当前使用的账号索引
-	blockedAccounts     map[string]string   // 账号封禁状态 map[username]date (YYYY-MM-DD)
+	logMu               sync.RWMutex
+	webEvents           *webEventHub
+	currentAccountIndex int               // 当前使用的账号索引
+	blockedAccounts     map[string]string // 账号封禁状态 map[username]date (YYYY-MM-DD)
 }
 
 const bangumiCacheTTL = 24 * time.Hour
@@ -164,6 +167,7 @@ func NewApp() *App {
 		crawler:         crawlerClient,
 		imgProxy:        imgProxySvc,
 		logHistory:      make([]map[string]string, 0),
+		webEvents:       newWebEventHub(),
 		blockedAccounts: make(map[string]string),
 	}
 }
@@ -178,6 +182,7 @@ func (a *App) startup(ctx context.Context) {
 			fmt.Printf("❌ [ImgProxy] 启动失败: %v\n", err)
 		}
 	}
+	a.startWebServer(ctx)
 
 	// ⚡ 自动登录 PikPak (如果 config.json 里填了且开启了自动登录)
 	users := a.configMgr.Data.GlobalSettings.PikPakUsers
@@ -226,6 +231,7 @@ func (a *App) Login(username, password string) string {
 	if a.ctx != nil {
 		runtime.EventsEmit(a.ctx, "pikpak-status", "Success")
 	}
+	a.webEvents.publish("pikpak-status", "Success")
 
 	// 🔥 把 PikPak 的 /stream 流式代理挂到 imgproxy 的 mux 上（共享端口 54321）
 	if a.imgProxy != nil {
@@ -381,21 +387,26 @@ func (a *App) Log(level, message string) {
 	}
 
 	// 保存到历史
+	a.logMu.Lock()
 	a.logHistory = append(a.logHistory, logEntry)
 	// 限制历史长度
 	if len(a.logHistory) > 1000 {
 		a.logHistory = a.logHistory[1:]
 	}
+	a.logMu.Unlock()
 
 	// 发送到前端
 	if a.ctx != nil {
 		runtime.EventsEmit(a.ctx, "log-message", logEntry)
 	}
+	a.webEvents.publish("log-message", logEntry)
 }
 
 // GetLogs 获取日志历史
 func (a *App) GetLogs() []map[string]string {
-	return a.logHistory
+	a.logMu.RLock()
+	defer a.logMu.RUnlock()
+	return append([]map[string]string(nil), a.logHistory...)
 }
 
 // GetPikPakStatus 获取 PikPak 登录状态
@@ -1102,6 +1113,11 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 				"path":       savePath,
 			})
 		}
+		a.webEvents.publish("download-complete", map[string]interface{}{
+			"subject_id": subjectID,
+			"ep_sort":    epSort,
+			"path":       savePath,
+		})
 	}()
 
 	return "Started"

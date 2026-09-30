@@ -177,7 +177,7 @@
 
               <!-- 剧集列表预览 -->
               <div>
-                <h3 class="text-lg font-bold text-white mb-3">剧集列表 <span class="text-xs font-normal text-gray-500 ml-2">(左键: 播放/下载，右键: 标记观看，中键: 删除)</span></h3>
+                <h3 class="text-lg font-bold text-white mb-3">剧集列表 <span class="text-xs font-normal text-gray-500 ml-2">{{ isWebMode() ? '(左键: 下载，右键: 标记观看)' : '(左键: 播放/下载，右键: 标记观看，中键: 删除)' }}</span></h3>
                 <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2 max-h-40 overflow-y-auto pr-2">
                   <div v-for="ep in detailData.episodes" :key="ep.id" 
                        @click="handleEpisodeClick(ep, $event)"
@@ -267,9 +267,9 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue';
-import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, PlayMagnet, DownloadEpisode, PlayLocalEpisode, DeleteEpisodeData, SearchEpisodeMagnetList, SaveEpisodeMagnet } from '../../wailsjs/go/main/App';
-import { EventsOn } from '../../wailsjs/runtime/runtime';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, PlayMagnet, DownloadEpisode, PlayLocalEpisode, DeleteEpisodeData, SearchEpisodeMagnetList, SaveEpisodeMagnet, EventsOn, isWebMode } from '../api';
+import { proxyImg } from '../utils/image';
 
 const calendar = ref([]);
 const localFollows = ref([]); // 本地追番列表
@@ -289,19 +289,6 @@ const magnetPickerEp = ref(null);
 const magnetSearchKeyword = ref('');
 const magnetSearching = ref(false);
 const magnetCandidates = ref([]);
-
-// 把 bgm.tv 的图片走后端代理（绕开 Webview 直连被切的问题）
-// 后端代理服务在 127.0.0.1:54321，PikPak 登录后自动启动
-const proxyImg = (url) => {
-  if (!url) return '';
-  // 先升级 http -> https，避免混合内容警告
-  const httpsUrl = url.replace(/^http:\/\//i, 'https://');
-  // 已经是本地代理的不重复包装
-  if (httpsUrl.startsWith('http://127.0.0.1:')) return httpsUrl;
-  // 非 http(s) 直接返回（base64、data: 等）
-  if (!/^https?:\/\//i.test(httpsUrl)) return httpsUrl;
-  return `http://127.0.0.1:54321/img?u=${encodeURIComponent(httpsUrl)}`;
-};
 
 // 代理也加载失败时，回退到原始 URL 再尝试一次（万一用户的网络能直连呢）
 const onImgError = (event, originalUrl) => {
@@ -425,9 +412,17 @@ const getMagnet = async (ep) => {
 
 const handleEpisodeClick = async (ep, event) => {
     if (!detailData.value) return;
+    if (!detailData.value.is_followed) {
+        alert('请先追番，再下载这一集');
+        return;
+    }
     
     // 1. 如果已下载，直接播放本地文件
     if (detailData.value.downloaded_eps && detailData.value.downloaded_eps.includes(ep.sort)) {
+        if (isWebMode()) {
+            alert('这一集已下载到家里的电脑');
+            return;
+        }
         try {
             console.log("正在请求播放本地文件...");
             const res = await PlayLocalEpisode(detailData.value.subject.id, ep.sort);
@@ -488,7 +483,11 @@ const selectMagnet = async (item) => {
   
   // 保存磁力到本地
   try {
-    await SaveEpisodeMagnet(detailData.value.subject.id, magnetPickerEp.value.sort, item.magnet);
+    const saved = await SaveEpisodeMagnet(detailData.value.subject.id, magnetPickerEp.value.sort, item.magnet);
+    if (saved !== 'Success') {
+      alert('保存磁力链接失败: ' + saved);
+      return;
+    }
     
     // 更新 UI
     const epKey = magnetPickerEp.value.sort.toString();
@@ -511,6 +510,7 @@ const selectMagnet = async (item) => {
 };
 
 const handleEpisodeDelete = async (ep) => {
+  if (isWebMode()) return;
   if (!detailData.value) return;
   
   const epKey = ep.sort.toString();
@@ -628,11 +628,12 @@ const toggleCollection = async (item) => {
   }
 };
 
+let stopDownloadEvents;
 onMounted(() => {
   fetchCalendar();
 
   // 监听下载完成事件，实时更新 UI
-  EventsOn("download-complete", (data) => {
+  stopDownloadEvents = EventsOn("download-complete", (data) => {
       console.log("收到下载完成事件:", data);
       // data: { subject_id, ep_sort, path }
       
@@ -647,6 +648,7 @@ onMounted(() => {
       }
   });
 });
+onUnmounted(() => stopDownloadEvents?.());
 </script>
 
 <style scoped>

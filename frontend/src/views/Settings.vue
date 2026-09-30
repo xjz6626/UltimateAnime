@@ -98,6 +98,14 @@
       </div>
       </div>
 
+      <div class="bg-gray-800 p-6 rounded-lg shadow-lg">
+        <h2 class="text-lg font-semibold mb-3 text-blue-400">🌐 远端网页</h2>
+        <p class="text-sm text-gray-300 mb-3">桌面应用运行时，可在本机打开 <a href="http://127.0.0.1:54322" target="_blank" rel="noopener noreferrer" class="text-blue-400 hover:underline">http://127.0.0.1:54322</a>。</p>
+        <p class="text-sm text-gray-300 mb-2">要通过 Tailscale 从其他电脑访问，请先连接 Tailscale，并在家中电脑运行：</p>
+        <code class="block bg-gray-950 border border-gray-700 rounded px-3 py-2 text-sm text-pink-300 select-all">tailscale ip -4</code>
+        <p class="text-xs text-gray-400 mt-3">在另一台已登录同一 tailnet 的电脑上打开 http://显示的 IP:54322。家中电脑和本应用需要保持运行。</p>
+      </div>
+
       <!-- 保存按钮 -->
       <div class="flex justify-end pt-4">
         <button @click="saveConfig" :disabled="saving" class="bg-pink-600 hover:bg-pink-700 disabled:bg-gray-600 text-white px-6 py-3 rounded-lg font-bold shadow-lg transition-all transform hover:scale-105 flex items-center">
@@ -111,7 +119,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue';
-import { GetAppConfig, SaveAppConfig, GetBlockedAccounts, SetAccountBlockStatus, ClearPikPakStorage } from '../../wailsjs/go/main/App';
+import { GetAppConfig, SaveAppConfig, GetBlockedAccounts, SetAccountBlockStatus, ClearPikPakStorage } from '../api';
 
 const saving = ref(false);
 const clearingAccounts = ref({});

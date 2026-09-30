@@ -3,6 +3,7 @@ import Home from '../views/Home.vue'
 import Discovery from '../views/Discovery.vue'
 import Settings from '../views/Settings.vue'
 import Logs from '../views/Logs.vue'
+import { isWebMode } from '../api'
 
 const routes = [
   { path: '/', component: Home },
@@ -15,5 +16,7 @@ const router = createRouter({
   history: createWebHashHistory(),
   routes,
 })
+
+router.beforeEach((to) => isWebMode() && to.path === '/settings' ? '/' : true)
 
 export default router

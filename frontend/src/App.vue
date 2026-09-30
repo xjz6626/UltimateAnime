@@ -17,7 +17,7 @@
           <span class="mr-3 text-xl group-hover:scale-110 transition-transform">📅</span>
           <span class="font-medium">当季新番</span>
         </router-link>
-        <router-link to="/settings" class="nav-item group" active-class="active">
+        <router-link v-if="!isWebMode()" to="/settings" class="nav-item group" active-class="active">
           <span class="mr-3 text-xl group-hover:scale-110 transition-transform">⚙️</span>
           <span class="font-medium">系统设置</span>
         </router-link>
@@ -39,6 +39,9 @@
     </div>
 
     <div class="flex-1 overflow-y-auto bg-gray-900">
+      <div v-if="isWebMode() && pikpakStatus !== 'Success'" class="bg-amber-900/50 border-b border-amber-700 px-6 py-3 text-sm text-amber-100">
+        PikPak 未连接。请在家里的桌面端登录，或开启自动登录后重启应用。
+      </div>
       <router-view v-slot="{ Component }">
         <transition name="fade" mode="out-in">
           <component :is="Component" />
@@ -50,8 +53,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { EventsOn } from '../wailsjs/runtime/runtime'
-import { GetPikPakStatus } from '../wailsjs/go/main/App'
+import { EventsOn, GetPikPakStatus, isWebMode } from './api'
 
 // 这里将来调用后端的 AutoLogin
 const pikpakStatus = ref("未登录") 

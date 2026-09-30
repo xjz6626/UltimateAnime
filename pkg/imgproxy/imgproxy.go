@@ -3,6 +3,7 @@ package imgproxy
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -71,6 +72,16 @@ func (p *Proxy) Start(port string) error {
 }
 
 func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
+	p.serveImage(w, r, nil)
+}
+
+// ServeImage serves an image while checking every redirect against allowed.
+// The web interface uses this to keep its image endpoint on trusted hosts.
+func (p *Proxy) ServeImage(w http.ResponseWriter, r *http.Request, allowed func(*url.URL) bool) {
+	p.serveImage(w, r, allowed)
+}
+
+func (p *Proxy) serveImage(w http.ResponseWriter, r *http.Request, allowed func(*url.URL) bool) {
 	raw := r.URL.Query().Get("u")
 	if raw == "" {
 		http.Error(w, "missing u", http.StatusBadRequest)
@@ -90,11 +101,13 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	cachePath := filepath.Join(p.cacheDir, hash+ext)
 
-	if data, err := os.ReadFile(cachePath); err == nil && len(data) > 0 {
-		w.Header().Set("Cache-Control", "public, max-age=604800")
-		w.Header().Set("Content-Type", guessContentType(ext))
-		w.Write(data)
-		return
+	if allowed == nil {
+		if data, err := os.ReadFile(cachePath); err == nil && len(data) > 0 {
+			w.Header().Set("Cache-Control", "public, max-age=604800")
+			w.Header().Set("Content-Type", guessContentType(ext))
+			w.Write(data)
+			return
+		}
 	}
 
 	// 2. 准备 HTTP client，按需走上游代理
@@ -111,11 +124,23 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	if allowed != nil {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 || !allowed(req.URL) {
+				return errors.New("image redirect denied")
+			}
+			return nil
+		}
+	}
 
 	// 3. 拉图
 	req, err := http.NewRequest("GET", raw, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if allowed != nil && !allowed(req.URL) {
+		http.Error(w, "image URL denied", http.StatusBadRequest)
 		return
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
@@ -134,23 +159,44 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	var body io.Reader = resp.Body
+	if allowed != nil {
+		body = io.LimitReader(resp.Body, 20<<20+1)
+	}
+	data, err := io.ReadAll(body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if allowed != nil {
+		if len(data) > 20<<20 {
+			http.Error(w, "image too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		contentType := http.DetectContentType(data)
+		if !strings.HasPrefix(contentType, "image/") {
+			http.Error(w, "response is not an image", http.StatusUnsupportedMediaType)
+			return
+		}
+		w.Header().Set("Content-Security-Policy", "sandbox")
+		w.Header().Set("Content-Type", contentType)
+	}
 
 	// 4. 写缓存（异步，避免阻塞响应）
-	go func(path string, b []byte) {
-		_ = os.WriteFile(path, b, 0644)
-	}(cachePath, data)
+	if allowed == nil {
+		go func(path string, b []byte) {
+			_ = os.WriteFile(path, b, 0644)
+		}(cachePath, data)
+	}
 
 	// 5. 返回给浏览器
 	w.Header().Set("Cache-Control", "public, max-age=604800")
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	} else {
-		w.Header().Set("Content-Type", guessContentType(ext))
+	if allowed == nil {
+		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		} else {
+			w.Header().Set("Content-Type", guessContentType(ext))
+		}
 	}
 	w.Write(data)
 }

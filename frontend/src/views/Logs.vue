@@ -18,9 +18,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue';
-import { EventsOn } from '../../wailsjs/runtime/runtime';
-import { GetLogs } from '../../wailsjs/go/main/App';
+import { ref, onMounted, onUnmounted, nextTick } from 'vue';
+import { EventsOn, GetLogs } from '../api';
 
 const logs = ref([]);
 const logContainer = ref(null);
@@ -55,11 +54,12 @@ const fetchHistory = async () => {
   }
 };
 
+let stopLogEvents;
 onMounted(() => {
   fetchHistory();
   
   // 监听后端日志事件
-  EventsOn("log-message", (data) => {
+  stopLogEvents = EventsOn("log-message", (data) => {
     logs.value.push(data);
     // 自动滚动到底部
     nextTick(() => {
@@ -69,4 +69,5 @@ onMounted(() => {
     });
   });
 });
+onUnmounted(() => stopLogEvents?.());
 </script>
