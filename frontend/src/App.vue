@@ -48,6 +48,7 @@
       </span>
     </header>
 
+    <DanmakuPicker />
     <main class="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain bg-gray-900">
       <router-view v-slot="{ Component }">
         <transition name="fade" mode="out-in">
@@ -73,6 +74,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { EventsOn, GetPikPakStatus, isWebMode } from './api'
+import DanmakuPicker from './components/DanmakuPicker.vue'
 
 const pikpakStatus = ref("未登录") 
 

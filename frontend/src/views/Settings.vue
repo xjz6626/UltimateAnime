@@ -68,6 +68,28 @@
         <p class="text-xs text-gray-400 mt-3">已保存的磁力链接会优先复用。自动搜索失败时会打开手选窗口。</p>
       </div>
 
+      <div class="bg-gray-800 p-6 rounded-lg shadow-lg">
+        <h2 class="text-lg font-semibold mb-4 text-pink-500">💬 B 站弹幕</h2>
+        <label class="flex items-center justify-between gap-4 cursor-pointer">
+          <span>
+            <span class="block font-medium">下载并播放 B 站弹幕</span>
+            <span class="block text-sm text-gray-400 mt-1">下载前选择 B 站番剧或普通视频作为弹幕来源，播放时由 MPV 自动加载。</span>
+          </span>
+          <input v-model="config.danmaku.enabled" type="checkbox" class="w-5 h-5 accent-pink-500 flex-shrink-0">
+        </label>
+        <label class="mt-4 flex cursor-pointer items-center justify-between gap-4">
+          <span class="text-sm text-gray-300">自动匹配弹幕来源 <span class="mt-1 block text-xs text-gray-400">默认关闭，由你选择视频和集数；开启后按番剧名称、季度和集数匹配。</span></span>
+          <input v-model="config.danmaku.auto_select" type="checkbox" class="h-5 w-5 shrink-0 accent-pink-500">
+        </label>
+        <BilibiliLogin class="mt-4" :configured="!!config.danmaku.bilibili_cookie" @session-updated="updateBilibiliSession" />
+        <details class="mt-4">
+          <summary class="cursor-pointer text-sm text-gray-400">手动填写 Cookie（高级）</summary>
+          <label class="block text-sm text-gray-400 mb-1">B 站 Cookie <span class="text-xs text-gray-500">(可选)</span></label>
+          <input v-model="config.danmaku.bilibili_cookie" type="password" autocomplete="off" class="w-full bg-gray-900 border border-gray-700 rounded p-2.5 text-white focus:border-pink-500 focus:outline-none transition-colors" placeholder="匿名搜索受限时，可填写已登录 B 站的 Cookie">
+        </details>
+        <p class="text-xs text-gray-400 mt-3">找不到对应番剧、集数或请求失败时会跳过弹幕，视频继续下载。弹幕来自当前弹幕池，不保证包含全部历史弹幕。</p>
+      </div>
+
       <!-- 播放器设置 -->
       <div class="bg-gray-800 p-6 rounded-lg shadow-lg">
         <h2 class="text-lg font-semibold mb-4 text-blue-500 flex items-center">
@@ -127,6 +149,7 @@
 <script setup>
 import { ref, onMounted } from 'vue';
 import { GetAppConfig, SaveAppConfig, GetBlockedAccounts, SetAccountBlockStatus, ClearPikPakStorage } from '../api';
+import BilibiliLogin from '../components/BilibiliLogin.vue';
 
 const saving = ref(false);
 const clearingAccounts = ref({});
@@ -134,6 +157,7 @@ const config = ref({
   global_settings: { pikpak_users: [''], pikpak_password: '', proxy: '' },
   local_storage: { anime_dir: '' },
   torrent_searcher: { auto_select_magnet: false },
+  danmaku: { enabled: true, auto_select: false, bilibili_cookie: '' },
   player: { mpv_path: '', mpv_args: '' }
 });
 const blockedAccounts = ref({});
@@ -145,6 +169,7 @@ const loadConfig = async () => {
     if (!res.global_settings.pikpak_users) res.global_settings.pikpak_users = [''];
     if (res.global_settings.pikpak_users.length === 0) res.global_settings.pikpak_users.push('');
     if (!res.torrent_searcher) res.torrent_searcher = { auto_select_magnet: false };
+    if (!res.danmaku) res.danmaku = { enabled: true, auto_select: false, bilibili_cookie: '' };
     // 确保 player 存在
     if (!res.player) res.player = { mpv_path: '', mpv_args: '' };
     
@@ -160,6 +185,13 @@ const loadBlockedAccounts = async () => {
   } catch (err) {
     console.error("加载封禁列表失败", err);
   }
+};
+
+const updateBilibiliSession = async () => {
+  try {
+    const latest = await GetAppConfig();
+    config.value.danmaku.bilibili_cookie = latest.danmaku.bilibili_cookie;
+  } catch (err) { alert('读取 B 站登录状态失败：' + err); }
 };
 
 const isBlocked = (user) => {

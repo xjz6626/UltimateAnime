@@ -15,6 +15,34 @@ type AppConfig struct {
 	TorrentSearcher TorrentSearcher `json:"torrent_searcher"`
 	BTDownloader    BTDownloader    `json:"bt_downloader"`
 	Player          PlayerSettings  `json:"player"`
+	Danmaku         DanmakuSettings `json:"danmaku"`
+}
+
+type DanmakuSettings struct {
+	Enabled        bool   `json:"enabled"`
+	AutoSelect     bool   `json:"auto_select"`
+	BilibiliCookie string `json:"bilibili_cookie"`
+}
+
+// UpdateBilibiliCookie changes only the login session, preserving concurrent
+// player, account and download settings. The login cookie is never logged.
+func (m *Manager) UpdateBilibiliCookie(cookie string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := m.Data
+	next.Danmaku.BilibiliCookie = cookie
+	encoded, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(m.ConfigPath, encoded, 0600); err != nil {
+		return err
+	}
+	if err := os.Chmod(m.ConfigPath, 0600); err != nil {
+		return err
+	}
+	m.Data = next
+	return nil
 }
 
 // PlayerSettings 播放器配置
@@ -94,6 +122,7 @@ func NewDefaultConfig() AppConfig {
 	cfg.GlobalSettings.Proxy = ""
 	cfg.LocalStorage.AnimeDir = "anime"
 	cfg.BTDownloader.ClientType = "pikpak"
+	cfg.Danmaku.Enabled = true
 	return cfg
 }
 

@@ -35,6 +35,9 @@ func TestLoadV01ConfigWithoutNewFields(t *testing.T) {
 	if got.Player.MPVPath != `C:\mpv\mpv.exe` || got.TorrentSearcher.AutoSelectMagnet {
 		t.Fatalf("legacy player or manual magnet mode changed: %+v, %+v", got.Player, got.TorrentSearcher)
 	}
+	if !got.Danmaku.Enabled || got.Danmaku.AutoSelect || got.Danmaku.BilibiliCookie != "" {
+		t.Fatalf("legacy config should enable anonymous danmaku by default: %+v", got.Danmaku)
+	}
 	if err := mgr.Save(); err != nil {
 		t.Fatal(err)
 	}

@@ -43,6 +43,17 @@ export const SaveAppConfig = (config) => invoke('SaveAppConfig', config);
 export const GetBlockedAccounts = () => invoke('GetBlockedAccounts');
 export const SetAccountBlockStatus = (username, blocked) => invoke('SetAccountBlockStatus', username, blocked);
 export const ClearPikPakStorage = (username) => invoke('ClearPikPakStorage', username);
+export const GetDanmakuPreferences = () => invoke('GetDanmakuPreferences');
+export const GetEpisodeDanmakuSource = (id, episode) => invoke('GetEpisodeDanmakuSource', id, episode);
+export const SearchBilibiliDanmaku = (keyword, kind, page) => invoke('SearchBilibiliDanmaku', keyword, kind, page);
+export const GetBilibiliDanmakuParts = (kind, id) => invoke('GetBilibiliDanmakuParts', kind, id);
+export const SaveEpisodeDanmakuSource = (id, episode, source) => invoke('SaveEpisodeDanmakuSource', id, episode, source);
+export const RefreshEpisodeDanmaku = (id, episode) => invoke('RefreshEpisodeDanmaku', id, episode);
+export const StartBilibiliLogin = () => invoke('StartBilibiliLogin');
+export const PollBilibiliLogin = (key) => invoke('PollBilibiliLogin', key);
+export const CancelBilibiliLogin = (key) => invoke('CancelBilibiliLogin', key);
+export const GetBilibiliLoginStatus = () => invoke('GetBilibiliLoginStatus');
+export const ClearBilibiliLogin = () => invoke('ClearBilibiliLogin');
 
 const listeners = new Map();
 let eventSource;

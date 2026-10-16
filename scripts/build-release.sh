@@ -20,7 +20,7 @@ go build -trimpath -tags 'production,webkit2_41' -ldflags '-s -w' -o "$stage_dir
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -tags production -ldflags '-H=windowsgui -s -w' -o "$stage_dir/windows/UltimateAnime.exe" .
 
 for platform in linux windows; do
-  cp config.example.json followed.example.json README-用户使用.md CHANGELOG.md LICENSE "$stage_dir/$platform/"
+  cp config.example.json followed.example.json README-用户使用.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md "$stage_dir/$platform/"
   archive="$output_dir/UltimateAnime-${version}-${platform}-amd64.zip"
   (cd "$stage_dir/$platform" && zip -q -r "$archive" .)
   printf 'Created %s\n' "$archive"

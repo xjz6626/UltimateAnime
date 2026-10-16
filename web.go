@@ -352,6 +352,46 @@ func (a *App) webCallContext(ctx context.Context, method string, args []json.Raw
 			return nil, err
 		}
 		return a.DownloadEpisode(id, episode, magnet), nil
+	case "GetDanmakuPreferences":
+		if err := webArgs(args); err != nil {
+			return nil, err
+		}
+		return a.GetDanmakuPreferences(), nil
+	case "GetEpisodeDanmakuSource":
+		var id int
+		var episode float64
+		if err := webArgs(args, &id, &episode); err != nil {
+			return nil, err
+		}
+		return a.GetEpisodeDanmakuSource(id, episode)
+	case "SearchBilibiliDanmaku":
+		var keyword, kind string
+		var page int
+		if err := webArgs(args, &keyword, &kind, &page); err != nil {
+			return nil, err
+		}
+		return a.SearchBilibiliDanmaku(keyword, kind, page)
+	case "GetBilibiliDanmakuParts":
+		var kind, id string
+		if err := webArgs(args, &kind, &id); err != nil {
+			return nil, err
+		}
+		return a.GetBilibiliDanmakuParts(kind, id)
+	case "SaveEpisodeDanmakuSource":
+		var id int
+		var episode float64
+		var choice DanmakuChoice
+		if err := webArgs(args, &id, &episode, &choice); err != nil {
+			return nil, err
+		}
+		return a.SaveEpisodeDanmakuSource(id, episode, choice), nil
+	case "RefreshEpisodeDanmaku":
+		var id int
+		var episode float64
+		if err := webArgs(args, &id, &episode); err != nil {
+			return nil, err
+		}
+		return a.RefreshEpisodeDanmaku(id, episode), nil
 	default:
 		return nil, fmt.Errorf("method %q is unavailable on the web", method)
 	}

@@ -39,6 +39,9 @@ type App struct {
 	progressMu          sync.Mutex
 	mappingMu           sync.Mutex
 	searchMu            sync.Mutex
+	danmakuMu           sync.Mutex
+	bilibiliLoginMu     sync.Mutex
+	bilibiliLogin       *bilibiliLoginSession
 	searches            map[string]context.CancelFunc
 	webEvents           *webEventHub
 	loginMu             sync.Mutex
@@ -469,7 +472,7 @@ func (a *App) GetAutoSelectMagnet() bool {
 // SaveAppConfig 保存配置
 func (a *App) SaveAppConfig(jsonStr string) string {
 	a.Log("INFO", "保存配置...")
-	var newConfig config.AppConfig
+	newConfig := config.NewDefaultConfig()
 	if err := json.Unmarshal([]byte(jsonStr), &newConfig); err != nil {
 		return fmt.Sprintf("Error: 解析配置失败 %v", err)
 	}
@@ -1122,6 +1125,20 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 		savePath := filepath.Join(downloadDir, safeFileName)
 		a.Log("INFO", fmt.Sprintf("开始下载到: %s", savePath))
 
+		// Fetch comments while the video downloads. Failure is logged separately;
+		// it must never turn a successful video transfer into a failed download.
+		danmakuDone := make(chan struct{})
+		danmakuParent := a.ctx
+		if danmakuParent == nil {
+			danmakuParent = context.Background()
+		}
+		danmakuCtx, cancelDanmaku := context.WithCancel(danmakuParent)
+		defer cancelDanmaku()
+		go func() {
+			defer close(danmakuDone)
+			a.prepareEpisodeDanmaku(danmakuCtx, subjectID, epSort, savePath)
+		}()
+
 		// 3. 开始下载
 		var lastTime = time.Now()
 		var lastBytes int64 = 0
@@ -1173,6 +1190,7 @@ func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) stri
 		}
 
 		a.Log("INFO", fmt.Sprintf("下载完成: %s", fileName))
+		<-danmakuDone
 
 		// 4. 标记为已下载
 		a.markEpisodeDownloaded(subjectID, epSort, savePath)
@@ -1280,6 +1298,7 @@ func (a *App) PlayLocalEpisode(subjectID int, epSort float64) string {
 		userArgs := strings.Fields(playerSettings.MPVArgs)
 		args = append(args, userArgs...)
 	}
+	args = append(args, a.localDanmakuArgs(filePath)...)
 
 	// 构造命令
 	cmd := exec.Command(mpvPath, args...)
@@ -1563,6 +1582,9 @@ func (a *App) DeleteEpisodeData(subjectID int, epSort float64) string {
 				a.Log("WARN", fmt.Sprintf("删除本地文件失败: %v", err))
 			} else {
 				a.Log("INFO", fmt.Sprintf("✅ 已删除本地文件: %s", filePath))
+				if err := os.Remove(danmakuPath(filePath)); err != nil && !os.IsNotExist(err) {
+					a.Log("WARN", fmt.Sprintf("删除弹幕文件失败: %v", err))
+				}
 				deleted = true
 			}
 			delete(targetItem.LocalFiles, epKey)

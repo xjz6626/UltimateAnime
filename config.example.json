@@ -15,6 +15,11 @@
   "torrent_searcher": {
     "auto_select_magnet": false
   },
+  "danmaku": {
+    "enabled": true,
+    "auto_select": false,
+    "bilibili_cookie": ""
+  },
   "player": {
     "mpv_path": "",
     "mpv_args": ""

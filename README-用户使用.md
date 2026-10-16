@@ -4,8 +4,8 @@
 
 前往 [Releases 页面](https://github.com/xjz6626/UltimateAnime/releases) 下载对应系统的 zip：
 
-- Windows 10/11 amd64 → `UltimateAnime-v0.2.0-windows-amd64.zip`
-- Linux amd64 → `UltimateAnime-v0.2.0-linux-amd64.zip`（需要 GTK 3 和 WebKit2GTK 4.1）
+- Windows 10/11 amd64 → `UltimateAnime-v0.3.0-windows-amd64.zip`
+- Linux amd64 → `UltimateAnime-v0.3.0-linux-amd64.zip`（需要 GTK 3 和 WebKit2GTK 4.1）
 
 解压到独立目录，例如 Windows 的 `D:\UltimateAnime\` 或 Linux 的 `~/Applications/UltimateAnime/`。Linux 请从该目录启动，使配置和追番文件能被正确读取。
 
@@ -92,6 +92,14 @@ chmod +x UltimateAnime
 4. 下载完成后剧集变蓝，左键点击调用 MPV 播放
 
 默认需要手动选择磁力。若想点击剧集后自动优选并下载，可在桌面端“系统设置 → 磁力选择”打开开关，或在 `config.json` 的 `torrent_searcher` 中设置 `"auto_select_magnet": true`；网页端也会按这个设置运行。
+
+下载前默认显示 B 站弹幕来源选择窗口。可搜索番剧或普通视频，也可直接输入 BV 号、`ss`／`ep` 番剧链接；点选视频后确认对应集数或分 P。确认后会保存选择并下载弹幕，转换成视频旁的 `视频名.danmaku.ass`。选“仅下载视频”可跳过弹幕；关闭窗口会取消本次下载。已有本地视频可在番剧详情页点击“选择／更换 B 站弹幕”，选择目标集数并保存，程序会重新获取弹幕，无需重新下载视频。下次启动 MPV 时加载更新后的弹幕。
+
+在“系统设置 → B 站弹幕”可关闭整个功能，或开启“自动匹配弹幕来源”。自动模式比较追番中文名和原名，统一季度写法并核对可用的年份，再匹配 B 站标注的正片集数；有多个无法区分的同名结果时跳过，不按列表顺序猜集数。旧配置缺少 `danmaku` 时默认开启弹幕、关闭自动匹配；手动配置可添加 `"danmaku": {"enabled": true, "auto_select": false, "bilibili_cookie": ""}`。
+
+Cookie 是网站识别登录会话的信息。这里使用你自己的 B 站账号登录后的 Cookie；无需手动获取，在设置里点击“扫码登录 B 站”，用 B 站手机 App 扫码并确认即可自动获取并保存到本机 `config.json`，扫码成功立即生效。支持取消、过期后刷新及清除本机登录信息，仍可在高级选项手动填写 Cookie。账号登录只在桌面端设置，远端网页可以选择弹幕来源但不会收到 Cookie。
+
+MPV 自动加载 ASS 弹幕，普通字幕可作为第二字幕同时显示；无需安装转换工具。弹幕搜索或下载失败不会中断视频下载，原因可在日志中查看。弹幕来自当前弹幕池，不保证包含全部历史弹幕；不同版本的片头或剪辑可能导致时间偏移，可用 MPV 的字幕延迟调整。删除本地视频时也会删除对应的 ASS 弹幕文件。
 
 手机远端访问：先在家中电脑启动程序并连接 Tailscale，再在手机上连接同一 tailnet，打开 `http://家中电脑的 Tailscale IPv4:54322`。手机网页使用底部导航；点按剧集后可选择下载或标记观看。网页端不提供账号设置和本地播放器。
 

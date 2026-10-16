@@ -127,6 +127,8 @@
                 <p class="text-gray-400 text-sm leading-relaxed max-h-32 overflow-y-auto pr-2">{{ detailData.subject.summary || '暂无简介' }}</p>
               </div>
 
+              <button @click="requestDanmakuSource(detailData.subject.id, detailData.episodes[0]?.sort || 1, true, detailData.episodes)" class="mb-4 min-h-[44px] rounded border border-pink-500/40 bg-gray-800 px-4 text-sm text-pink-300">💬 选择／更换 B 站弹幕</button>
+
               <!-- 剧集列表预览 -->
               <div>
                 <h3 class="text-lg font-bold text-white mb-3">剧集列表 <span class="text-xs font-normal text-gray-500 ml-2" v-if="isWebMode()"><span class="lg:hidden">点按集数选择下载或标记观看</span><span class="hidden lg:inline">左键下载，右键标记观看</span></span><span v-else class="text-xs font-normal text-gray-500 ml-2">左键播放/下载，右键标记观看，中键删除</span></h3>
@@ -235,9 +237,10 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue';
-import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, GetAutoSelectMagnet, PlayMagnet, DownloadEpisode, PlayLocalEpisode, DeleteEpisodeData, SaveEpisodeMagnet, EventsOn, isWebMode } from '../api';
+import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, GetAutoSelectMagnet, PlayMagnet, PlayLocalEpisode, DeleteEpisodeData, SaveEpisodeMagnet, EventsOn, isWebMode } from '../api';
 import { proxyImg } from '../utils/image';
 import { useMagnetSearch } from '../composables/useMagnetSearch';
+import { downloadWithDanmaku as DownloadEpisode, requestDanmakuSource } from '../composables/useDanmakuPicker';
 
 const calendar = ref([]);
 const formatAirTime = (timestamp) => new Date(timestamp * 1000).toLocaleString('zh-CN', {
@@ -490,7 +493,7 @@ const startEpisodeDownload = async (ep) => {
     const res = await DownloadEpisode(detailData.value.subject.id, ep.sort, magnet);
     if (res === 'Started') {
       alert(`已自动优选并开始下载第 ${ep.sort} 集`);
-    } else {
+    } else if (res !== 'Cancelled') {
       alert(res);
     }
   } catch (e) {
@@ -529,7 +532,7 @@ const selectMagnet = async (item) => {
     if (res === "Started") {
       alert("已开始下载: " + item.title);
       showMagnetPicker.value = false;
-    } else {
+    } else if (res !== 'Cancelled') {
       alert(res);
     }
   } catch (e) {

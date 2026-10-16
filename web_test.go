@@ -95,6 +95,7 @@ func TestWebRPCExposesAutoSelectModeWithoutFullConfig(t *testing.T) {
 	}
 	settings := config.NewDefaultConfig()
 	settings.TorrentSearcher.AutoSelectMagnet = true
+	settings.Danmaku.BilibiliCookie = "SESSDATA=private-cookie"
 	a := &App{configMgr: &config.Manager{ConfigPath: filepath.Join(t.TempDir(), "config.json"), Data: settings}}
 	handler := a.webHandler(dist)
 	call := func(method string) *httptest.ResponseRecorder {
@@ -111,6 +112,15 @@ func TestWebRPCExposesAutoSelectModeWithoutFullConfig(t *testing.T) {
 	}
 	if response := call("GetAppConfig"); response.Code != http.StatusBadRequest {
 		t.Fatalf("full config should stay unavailable: %d", response.Code)
+	}
+	preferences := call("GetDanmakuPreferences")
+	if preferences.Code != http.StatusOK || !strings.Contains(preferences.Body.String(), `"auto_select":false`) || strings.Contains(preferences.Body.String(), "private-cookie") {
+		t.Fatalf("public danmaku preferences: %d %q", preferences.Code, preferences.Body.String())
+	}
+	for _, method := range []string{"StartBilibiliLogin", "PollBilibiliLogin", "GetBilibiliLoginStatus", "ClearBilibiliLogin"} {
+		if response := call(method); response.Code != http.StatusBadRequest {
+			t.Fatalf("login RPC must stay desktop-only: %s", method)
+		}
 	}
 }
 
