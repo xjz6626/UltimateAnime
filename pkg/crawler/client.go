@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"context"
 	"encoding/base32"
 	"encoding/hex"
 	"encoding/xml"
@@ -185,6 +186,10 @@ func seasonNumber(title string) (int, bool) {
 }
 
 func (c *Crawler) fetchResources(terms []string) ([]ResourceItem, error) {
+	return c.fetchResourcesContext(context.Background(), terms, nil)
+}
+
+func (c *Crawler) fetchResourcesContext(ctx context.Context, terms []string, onPage func([]ResourceItem)) ([]ResourceItem, error) {
 	if len(terms) == 0 || strings.TrimSpace(terms[0]) == "" {
 		return nil, fmt.Errorf("搜索关键词不能为空")
 	}
@@ -197,7 +202,7 @@ func (c *Crawler) fetchResources(terms []string) ([]ResourceItem, error) {
 	for page := 1; page <= 3; page++ {
 		params.Set("page", strconv.Itoa(page))
 		var result SearchResp
-		response, err := c.client.R().SetQueryParamsFromValues(params).SetResult(&result).Get(apiURL)
+		response, err := c.client.R().SetContext(ctx).SetQueryParamsFromValues(params).SetResult(&result).Get(apiURL)
 		if err != nil {
 			if len(all) > 0 {
 				return all, nil
@@ -211,6 +216,9 @@ func (c *Crawler) fetchResources(terms []string) ([]ResourceItem, error) {
 			return nil, fmt.Errorf("搜索接口返回 HTTP %d", response.StatusCode())
 		}
 		all = append(all, result.Resources...)
+		if onPage != nil && len(result.Resources) > 0 {
+			onPage(result.Resources)
+		}
 		if result.Pagination.Complete || len(result.Resources) < 100 {
 			break
 		}
@@ -235,10 +243,14 @@ func mikanInfoHash(rawURL string) string {
 }
 
 func (c *Crawler) fetchMikanResources(keyword string) ([]ResourceItem, error) {
+	return c.fetchMikanResourcesContext(context.Background(), keyword)
+}
+
+func (c *Crawler) fetchMikanResourcesContext(ctx context.Context, keyword string) ([]ResourceItem, error) {
 	if c.mikanURL == "" {
 		return nil, nil
 	}
-	response, err := c.mikanClient.R().SetQueryParam("searchstr", keyword).Get(c.mikanURL)
+	response, err := c.mikanClient.R().SetContext(ctx).SetQueryParam("searchstr", keyword).Get(c.mikanURL)
 	if err != nil {
 		return nil, fmt.Errorf("蜜柑计划搜索请求失败: %w", err)
 	}
@@ -271,6 +283,10 @@ func (c *Crawler) fetchMikanResources(keyword string) ([]ResourceItem, error) {
 }
 
 func (c *Crawler) fetchAll(animeTerms []string, mikanQuery string) ([]ResourceItem, error, error) {
+	return c.fetchAllContext(context.Background(), animeTerms, mikanQuery, nil)
+}
+
+func (c *Crawler) fetchAllContext(ctx context.Context, animeTerms []string, mikanQuery string, onPage func([]ResourceItem)) ([]ResourceItem, error, error) {
 	var animeResources, mikanResources []ResourceItem
 	var animeErr, mikanErr error
 	var wg sync.WaitGroup
@@ -278,13 +294,16 @@ func (c *Crawler) fetchAll(animeTerms []string, mikanQuery string) ([]ResourceIt
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		animeResources, animeErr = c.fetchResources(animeTerms)
+		animeResources, animeErr = c.fetchResourcesContext(ctx, animeTerms, onPage)
 	}()
 	if searchMikan {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			mikanResources, mikanErr = c.fetchMikanResources(mikanQuery)
+			mikanResources, mikanErr = c.fetchMikanResourcesContext(ctx, mikanQuery)
+			if onPage != nil && len(mikanResources) > 0 {
+				onPage(mikanResources)
+			}
 		}()
 	}
 	wg.Wait()
@@ -384,27 +403,44 @@ func scoreTitle(title string) int {
 func matchingEpisodes(resources []ResourceItem, episode float64, name string) []TorrentItem {
 	items := make([]TorrentItem, 0)
 	seen := make(map[string]bool)
-	wantSeason, explicitSeason := seasonNumber(name)
-	if !explicitSeason {
-		wantSeason = 1
-	}
 	for _, resource := range resources {
 		key := magnetKey(resource.Magnet)
 		if resource.Magnet == "" || seen[key] || math.Abs(ParseEpisodeNumber(resource.Title)-episode) >= 0.01 {
 			continue
 		}
-		season, hasSeason := seasonNumber(resource.Title)
-		if (hasSeason && season != wantSeason) || (explicitSeason && !hasSeason) {
-			continue
-		}
 		seen[key] = true
 		items = append(items, toTorrentItem(resource))
 	}
-	sort.SliceStable(items, func(i, j int) bool { return scoreTitle(items[i].Title) > scoreTitle(items[j].Title) })
+	sort.SliceStable(items, func(i, j int) bool { return episodeScore(items[i].Title, name) > episodeScore(items[j].Title, name) })
 	return items
 }
 
+// Seasons affect preference, never whether a candidate can be shown.
+func episodeScore(title, name string) int {
+	score := scoreTitle(title)
+	want, explicit := seasonNumber(name)
+	season, hasSeason := seasonNumber(title)
+	if explicit {
+		if hasSeason && season == want {
+			score += 200
+		} else if hasSeason {
+			score -= 200
+		}
+	} else if !hasSeason || season == 1 {
+		score += 200
+	}
+	return score
+}
+
 func (c *Crawler) SearchEpisodeList(keywords []string, episode float64) ([]TorrentItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return c.SearchEpisodeListStream(ctx, keywords, episode, nil)
+}
+
+// SearchEpisodeListStream publishes cumulative, deduplicated candidates as each
+// source/page arrives. The callback is serialized, even when sources run together.
+func (c *Crawler) SearchEpisodeListStream(ctx context.Context, keywords []string, episode float64, onUpdate func([]TorrentItem)) ([]TorrentItem, error) {
 	if len(keywords) == 0 || episode <= 0 {
 		return nil, fmt.Errorf("缺少番剧名称或集数")
 	}
@@ -412,26 +448,61 @@ func (c *Crawler) SearchEpisodeList(keywords []string, episode float64) ([]Torre
 	if name == "" {
 		return nil, fmt.Errorf("缺少番剧名称或集数")
 	}
-	resources, firstErr, mikanErr := c.fetchAll([]string{name, episodeSearchTerm(episode)}, name+" "+episodeSearchTerm(episode))
-	items := matchingEpisodes(resources, episode, name)
-	if len(items) > 0 {
+	var mu sync.Mutex
+	var resources []ResourceItem
+	items := make([]TorrentItem, 0)
+	publish := func(page []ResourceItem) {
+		mu.Lock()
+		defer mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		resources = append(resources, page...)
+		next := matchingEpisodes(resources, episode, name)
+		if len(next) == len(items) {
+			return
+		}
+		items = next
+		if onUpdate != nil {
+			onUpdate(append([]TorrentItem(nil), items...))
+		}
+	}
+	var failures []error
+	reachable := false
+	mikanFailed := false
+	queries := episodeQueries(keywords)
+	for _, query := range queries {
+		for _, withEpisode := range []bool{true, false} {
+			if err := ctx.Err(); err != nil {
+				return items, err
+			}
+			terms := []string{query}
+			mikanQuery := query
+			if withEpisode {
+				terms = append(terms, episodeSearchTerm(episode))
+				mikanQuery += " " + episodeSearchTerm(episode)
+			}
+			if mikanFailed {
+				mikanQuery = ""
+			}
+			_, err, mikanErr := c.fetchAllContext(ctx, terms, mikanQuery, publish)
+			mikanFailed = mikanFailed || mikanErr != nil
+			reachable = reachable || err == nil
+			if err != nil {
+				failures = append(failures, err)
+			}
+			if ctx.Err() != nil {
+				return items, ctx.Err()
+			}
+			if len(items) > 0 {
+				return items, nil
+			}
+		}
+	}
+	if reachable {
 		return items, nil
 	}
-	// Publishers may use 1 instead of 01; retry by title and filter locally.
-	fallbackMikanQuery := name
-	if mikanErr != nil {
-		// A failed source should not add another full timeout to the title fallback.
-		fallbackMikanQuery = ""
-	}
-	resources, fallbackErr, _ := c.fetchAll([]string{name}, fallbackMikanQuery)
-	items = matchingEpisodes(resources, episode, name)
-	if len(items) > 0 {
-		return items, nil
-	}
-	if firstErr == nil || fallbackErr == nil {
-		return nil, nil
-	}
-	return nil, errors.Join(firstErr, fallbackErr)
+	return items, errors.Join(failures...)
 }
 
 func (c *Crawler) SearchEpisode(keywords []string, episode float64) (*TorrentItem, error) {

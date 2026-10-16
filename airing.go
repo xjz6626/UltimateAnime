@@ -17,13 +17,13 @@ import (
 )
 
 const (
-	airingWeekTTL    = 7 * 24 * time.Hour
-	airingRetryDelay = 5 * time.Minute
-	airingMappingTTL = 30 * 24 * time.Hour
-	airingMappingURL = "https://raw.githubusercontent.com/bangumi-data/bangumi-data/master/dist/data.json"
-	airingMappingCDN = "https://cdn.jsdelivr.net/npm/bangumi-data@0.3/dist/data.json"
-	airingGraphQLURL = "https://graphql.anilist.co"
-	airingUserAgent  = "UltimateAnime/0.1 (https://github.com/xjz6626/UltimateAnime)"
+	airingScheduleTTL = time.Hour
+	airingRetryDelay  = 5 * time.Minute
+	airingMappingTTL  = 30 * 24 * time.Hour
+	airingMappingURL  = "https://raw.githubusercontent.com/bangumi-data/bangumi-data/master/dist/data.json"
+	airingMappingCDN  = "https://cdn.jsdelivr.net/npm/bangumi-data@0.3/dist/data.json"
+	airingGraphQLURL  = "https://graphql.anilist.co"
+	airingUserAgent   = "UltimateAnime/0.1 (https://github.com/xjz6626/UltimateAnime)"
 )
 
 // The schedule cache is separate from followed.json so download and watch data
@@ -273,6 +273,8 @@ func sameLocalDay(a, b time.Time) bool {
 }
 
 func (a *App) cachedAiringMappings(ctx context.Context, source airingSource, follows []FollowedItem, now time.Time) (map[int]int, error) {
+	a.mappingMu.Lock()
+	defer a.mappingMu.Unlock()
 	path := filepath.Join(a.getCacheDir(), "airing_mappings.json")
 	var cache airingMappingCache
 	loaded, err := a.loadJSONCache(path, &cache)
@@ -337,10 +339,11 @@ func (a *App) followedAiringSnapshot() followedAiringCache {
 	}
 	source := newAiringSource(a.configMgr.Snapshot().GlobalSettings.Proxy)
 	changed := false
-	weeklyDue := cache.WeeklyCheckedAt.IsZero() || now.Sub(cache.WeeklyCheckedAt) >= airingWeekTTL
+	weeklyDue := cache.WeeklyCheckedAt.IsZero() || now.Sub(cache.WeeklyCheckedAt) >= airingScheduleTTL
 	for _, item := range follows {
 		entry, exists := cache.Entries[item.SubjectID]
-		if !exists || (entry.AniListID > 0 && entry.ReleaseStatus == "") {
+		if !exists || (entry.AniListID > 0 && entry.ReleaseStatus == "") ||
+			(entry.NextAiringAt > 0 && cache.WeeklyCheckedAt.Unix() < entry.NextAiringAt && entry.NextAiringAt <= now.Unix()) {
 			weeklyDue = true
 			break
 		}
@@ -437,7 +440,7 @@ func (a *App) GetFollowAirings() map[int]followedAiring {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 	for id, entry := range cache.Entries {
-		if cache.WeeklyCheckedAt.IsZero() || now.Sub(cache.WeeklyCheckedAt) >= airingWeekTTL {
+		if cache.WeeklyCheckedAt.IsZero() || now.Sub(cache.WeeklyCheckedAt) >= airingScheduleTTL || entry.NextAiringAt <= now.Unix() {
 			entry.NextEpisode = 0
 			entry.NextAiringAt = 0
 		}

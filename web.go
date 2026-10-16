@@ -233,7 +233,7 @@ func (a *App) handleWebRPC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "one JSON object required", http.StatusBadRequest)
 		return
 	}
-	result, err := a.webCall(request.Method, request.Args)
+	result, err := a.webCallContext(r.Context(), request.Method, request.Args)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -246,6 +246,10 @@ func (a *App) handleWebRPC(w http.ResponseWriter, r *http.Request) {
 
 // Only actions needed for remote discovery and downloading are exposed.
 func (a *App) webCall(method string, args []json.RawMessage) (any, error) {
+	return a.webCallContext(context.Background(), method, args)
+}
+
+func (a *App) webCallContext(ctx context.Context, method string, args []json.RawMessage) (any, error) {
 	switch method {
 	case "GetPikPakStatus":
 		if err := webArgs(args); err != nil {
@@ -317,6 +321,21 @@ func (a *App) webCall(method string, args []json.RawMessage) (any, error) {
 			return nil, err
 		}
 		return a.SearchEpisodeMagnetList(id, episode, keywords)
+	case "SearchEpisodeMagnetListStream":
+		var id int
+		var episode float64
+		var keywords, requestID string
+		if err := webArgs(args, &id, &episode, &keywords, &requestID); err != nil {
+			return nil, err
+		}
+		return a.searchEpisodeMagnetListStream(ctx, id, episode, keywords, requestID)
+	case "CancelEpisodeMagnetSearch":
+		var requestID string
+		if err := webArgs(args, &requestID); err != nil {
+			return nil, err
+		}
+		a.CancelEpisodeMagnetSearch(requestID)
+		return nil, nil
 	case "SaveEpisodeMagnet":
 		var id int
 		var episode float64

@@ -1,7 +1,11 @@
 // The same Vue views run inside Wails and in the browser served by the Go app.
 export const isWebMode = () => window.__ULTIMATEANIME_WEB__ === true;
 
-async function invoke(method, ...args) {
+function invoke(method, ...args) {
+  return invokeWithSignal(undefined, method, ...args);
+}
+
+async function invokeWithSignal(signal, method, ...args) {
   if (!isWebMode()) {
     return window.go.main.App[method](...args);
   }
@@ -9,6 +13,7 @@ async function invoke(method, ...args) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ method, args }),
+    signal,
   });
   if (!response.ok) {
     throw new Error((await response.text()).trim());
@@ -41,6 +46,48 @@ export const ClearPikPakStorage = (username) => invoke('ClearPikPakStorage', use
 
 const listeners = new Map();
 let eventSource;
+
+function waitForEventStream(signal) {
+  if (!isWebMode() || eventSource?.readyState === EventSource.OPEN) return Promise.resolve();
+  const source = eventSource;
+  return new Promise((resolve, reject) => {
+    const finish = (error) => {
+      clearTimeout(timeout);
+      source.removeEventListener('open', opened);
+      signal?.removeEventListener('abort', aborted);
+      error ? reject(error) : resolve();
+    };
+    const opened = () => finish();
+    const aborted = () => finish(new DOMException('搜索已取消', 'AbortError'));
+    // If SSE is temporarily unavailable, the RPC still returns a complete list.
+    const timeout = setTimeout(opened, 3000);
+    source.addEventListener('open', opened, { once: true });
+    signal?.addEventListener('abort', aborted, { once: true });
+    if (signal?.aborted) aborted();
+  });
+}
+
+export async function StreamEpisodeMagnets(id, episode, keywords, onUpdate, signal) {
+  const requestID = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const stop = EventsOn('magnet-search-results', (update) => {
+    if (!signal?.aborted && update.request_id === requestID) onUpdate(update.items || []);
+  });
+  const cancel = () => { invoke('CancelEpisodeMagnetSearch', requestID).catch(() => {}); };
+  let started = false;
+  try {
+    await waitForEventStream(signal);
+    if (signal?.aborted) return [];
+    signal?.addEventListener('abort', cancel, { once: true });
+    started = true;
+    const items = await invokeWithSignal(signal, 'SearchEpisodeMagnetListStream', id, episode, keywords, requestID);
+    if (!signal?.aborted) onUpdate(items || []);
+    return items || [];
+  } finally {
+    stop();
+    signal?.removeEventListener('abort', cancel);
+    if (started && signal?.aborted) cancel();
+  }
+}
 
 export function EventsOn(name, callback) {
   if (!isWebMode()) {

@@ -117,7 +117,7 @@
                 <div class="bg-gray-800 px-3 py-1 rounded text-green-400">
                   总集数: {{ detailData.subject.total_episodes || detailData.subject.eps || '?' }}
                 </div>
-                <div class="bg-pink-900/50 px-3 py-1 rounded text-pink-300 border border-pink-500/30">
+                <div :title="`进度来源：${detailData.progress_source || 'Bangumi'}`" class="bg-pink-900/50 px-3 py-1 rounded text-pink-300 border border-pink-500/30">
                   更新至: 第 {{ detailData.current_episode }} 话
                 </div>
               </div>
@@ -171,29 +171,30 @@
             />
             <button 
               @click="searchMagnetList" 
-              :disabled="magnetSearching"
               class="min-h-[44px] rounded bg-pink-600 px-6 py-2 font-bold text-white transition hover:bg-pink-700 disabled:bg-gray-600"
             >
-              {{ magnetSearching ? '搜索中...' : '🔍 搜索' }}
+              {{ magnetSearching ? '重新搜索' : '🔍 搜索' }}
             </button>
           </div>
         </div>
 
         <!-- 候选列表 -->
         <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6">
-          <div v-if="magnetSearching" class="text-center py-8 text-gray-400">
+          <div v-if="magnetSearching && magnetCandidates.length === 0" class="text-center py-8 text-gray-400">
             <div class="animate-spin inline-block w-8 h-8 border-4 border-pink-500 border-t-transparent rounded-full mb-2"></div>
             <p>正在搜索...</p>
           </div>
 
-          <div v-else-if="magnetCandidates.length === 0" class="text-center py-8 text-gray-400">
+          <div v-else-if="magnetCandidates.length === 0 && !magnetSearchError" class="text-center py-8 text-gray-400">
             暂无结果，请尝试修改关键词
           </div>
 
-          <div v-else class="space-y-2">
+          <p v-if="magnetSearching && magnetCandidates.length" role="status" class="mb-3 text-sm text-gray-400">已找到 {{ magnetCandidates.length }} 项，仍在搜索其他资源…</p>
+          <p v-if="magnetSearchError" role="alert" class="mb-3 text-sm text-red-400">{{ magnetSearchError }}</p>
+          <div v-if="magnetCandidates.length" class="space-y-2">
             <div 
-              v-for="(item, index) in magnetCandidates" 
-              :key="index"
+              v-for="item in magnetCandidates"
+              :key="item.magnet"
               @click="selectMagnet(item)"
               class="bg-gray-800 hover:bg-gray-750 border border-gray-700 hover:border-pink-500 rounded-lg p-4 cursor-pointer transition-all"
             >
@@ -233,9 +234,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue';
-import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, GetAutoSelectMagnet, PlayMagnet, DownloadEpisode, PlayLocalEpisode, DeleteEpisodeData, SearchEpisodeMagnetList, SaveEpisodeMagnet, EventsOn, isWebMode } from '../api';
+import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue';
+import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, GetAutoSelectMagnet, PlayMagnet, DownloadEpisode, PlayLocalEpisode, DeleteEpisodeData, SaveEpisodeMagnet, EventsOn, isWebMode } from '../api';
 import { proxyImg } from '../utils/image';
+import { useMagnetSearch } from '../composables/useMagnetSearch';
 
 const calendar = ref([]);
 const formatAirTime = (timestamp) => new Date(timestamp * 1000).toLocaleString('zh-CN', {
@@ -271,8 +273,8 @@ const showMagnetPicker = ref(false);
 const episodeAction = ref(null);
 const magnetPickerEp = ref(null);
 const magnetSearchKeyword = ref('');
-const magnetSearching = ref(false);
-const magnetCandidates = ref([]);
+const { searching: magnetSearching, candidates: magnetCandidates, error: magnetSearchError, search: runMagnetSearch, cancel: cancelMagnetSearch } = useMagnetSearch();
+watch(showMagnetPicker, (open) => { if (!open) cancelMagnetSearch(); });
 const episodeClickPending = ref({});
 
 // 代理也加载失败时，回退到原始 URL 再尝试一次（万一用户的网络能直连呢）
@@ -500,26 +502,12 @@ const startEpisodeDownload = async (ep) => {
 
 const searchMagnetList = async () => {
   if (!detailData.value || !magnetPickerEp.value) return;
-  
-  magnetSearching.value = true;
-  magnetCandidates.value = [];
-  
-  try {
-    const res = await SearchEpisodeMagnetList(
-      detailData.value.subject.id, 
-      magnetPickerEp.value.sort, 
-      magnetSearchKeyword.value
-    );
-    magnetCandidates.value = res || [];
-  } catch (e) {
-    alert("搜索失败: " + e);
-  } finally {
-    magnetSearching.value = false;
-  }
+  await runMagnetSearch(detailData.value.subject.id, magnetPickerEp.value.sort, magnetSearchKeyword.value);
 };
 
 const selectMagnet = async (item) => {
   if (!detailData.value || !magnetPickerEp.value) return;
+  cancelMagnetSearch();
   
   // 保存磁力到本地
   try {

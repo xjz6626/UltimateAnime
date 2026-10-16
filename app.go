@@ -36,6 +36,10 @@ type App struct {
 	logMu               sync.RWMutex
 	calendarMu          sync.Mutex
 	airingMu            sync.Mutex
+	progressMu          sync.Mutex
+	mappingMu           sync.Mutex
+	searchMu            sync.Mutex
+	searches            map[string]context.CancelFunc
 	webEvents           *webEventHub
 	loginMu             sync.Mutex
 	taskMu              sync.Mutex
@@ -43,8 +47,6 @@ type App struct {
 	currentAccountIndex int               // 当前使用的账号索引
 	blockedAccounts     map[string]string // 账号封禁状态 map[username]date (YYYY-MM-DD)
 }
-
-const bangumiCacheTTL = 24 * time.Hour
 
 type bangumiCacheEntry[T any] struct {
 	FetchedAt time.Time `json:"fetched_at"`
@@ -137,13 +139,6 @@ func (a *App) saveJSONCache(path string, payload any) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0644)
-}
-
-func (a *App) isCacheValid(fetchedAt time.Time) bool {
-	if fetchedAt.IsZero() {
-		return false
-	}
-	return time.Since(fetchedAt) < bangumiCacheTTL
 }
 
 // NewApp creates a new App application struct
@@ -630,11 +625,9 @@ func (a *App) SearchEpisodeMagnet(subjectID int, epSort float64) string {
 	}
 
 	// 3. 构造搜索关键词
-	keywords := []string{}
-	if targetItem.NameCN != "" {
-		keywords = append(keywords, targetItem.NameCN)
-	} else {
-		keywords = append(keywords, targetItem.Name)
+	keywords, err := a.episodeSearchKeywords(subjectID, "")
+	if err != nil {
+		return fmt.Sprintf("Error: %v", err)
 	}
 
 	// 4. 调用爬虫
@@ -665,26 +658,9 @@ func (a *App) SearchEpisodeMagnetList(subjectID int, epSort float64, customKeywo
 	a.Log("INFO", fmt.Sprintf("搜索磁力列表: ID=%d, Ep=%v, Keywords=%s", subjectID, epSort, customKeywords))
 
 	// 1. 构造搜索关键词
-	var keywords []string
-	if customKeywords != "" {
-		// 使用自定义关键词
-		keywords = []string{customKeywords}
-	} else {
-		// 使用默认关键词
-		list := a.GetLocalFollows()
-		for _, v := range list {
-			if v.SubjectID == subjectID {
-				if v.NameCN != "" {
-					keywords = append(keywords, v.NameCN)
-				} else {
-					keywords = append(keywords, v.Name)
-				}
-				break
-			}
-		}
-		if len(keywords) == 0 {
-			return nil, fmt.Errorf("未找到追番记录")
-		}
+	keywords, err := a.episodeSearchKeywords(subjectID, customKeywords)
+	if err != nil {
+		return nil, err
 	}
 
 	// 2. 调用爬虫获取候选列表
@@ -783,6 +759,7 @@ type AnimeDetail struct {
 	Subject        bangumi.SubjectDetail `json:"subject"`
 	Episodes       []bangumi.Episode     `json:"episodes"`
 	CurrentEpisode float64               `json:"current_episode"` // 当前更新到的集数
+	ProgressSource string                `json:"progress_source"`
 	IsFollowed     bool                  `json:"is_followed"`
 	WatchedEps     []float64             `json:"watched_eps"`     // 已观看集数
 	DownloadedEps  []float64             `json:"downloaded_eps"`  // 已下载集数
@@ -803,7 +780,7 @@ func (a *App) GetAnimeDetail(subjectID int) (*AnimeDetail, error) {
 	var subject *bangumi.SubjectDetail
 	var episodes []bangumi.Episode
 
-	if cacheLoaded && a.isCacheValid(cache.FetchedAt) {
+	if cacheLoaded && time.Since(cache.FetchedAt) < episodeProgressTTL {
 		a.Log("INFO", "使用本地 Bangumi 详情缓存")
 		subject = &cache.Data.Subject
 		episodes = cache.Data.Episodes
@@ -843,18 +820,13 @@ func (a *App) GetAnimeDetail(subjectID int) (*AnimeDetail, error) {
 		}
 	}
 
-	// 3. 计算当前更新到了第几集
-	// 逻辑：遍历剧集，找到 AirDate <= 今天 的最大 Sort
-	currentEp := 0.0
-	today := time.Now().Format("2006-01-02")
-
-	for _, ep := range episodes {
-		// 如果没有放送日期，或者放送日期在今天之前(或今天)
-		if ep.AirDate != "" && ep.AirDate <= today {
-			if ep.Sort > currentEp {
-				currentEp = ep.Sort
-			}
-		}
+	// Prefer confirmed airing schedules; Bangumi dates remain the offline fallback.
+	progress := a.subjectEpisodeProgress(subjectID, time.Now())
+	currentEp := currentEpisode(episodes, progress, time.Now())
+	episodes = includeAiredEpisodes(episodes, currentEp)
+	progressSource := "Bangumi"
+	if progress.Available {
+		progressSource = "AniList"
 	}
 
 	// 4. 检查是否已追番及观看进度
@@ -877,6 +849,7 @@ func (a *App) GetAnimeDetail(subjectID int) (*AnimeDetail, error) {
 		Subject:        *subject,
 		Episodes:       episodes,
 		CurrentEpisode: currentEp,
+		ProgressSource: progressSource,
 		IsFollowed:     isFollowed,
 		WatchedEps:     watchedEps,
 		DownloadedEps:  downloadedEps,

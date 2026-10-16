@@ -250,23 +250,29 @@ func (b *BangumiClient) GetSubjectDetail(subjectID int) (*SubjectDetail, error) 
 
 // GetSubjectEpisodes 获取番剧剧集列表
 func (b *BangumiClient) GetSubjectEpisodes(subjectID int) ([]Episode, error) {
-	var result struct {
-		Data []Episode `json:"data"`
+	var episodes []Episode
+	for offset := 0; offset < 20000; offset += 100 {
+		var result struct {
+			Total int       `json:"total"`
+			Data  []Episode `json:"data"`
+		}
+		response, err := b.client.R().
+			SetResult(&result).
+			SetQueryParam("subject_id", fmt.Sprintf("%d", subjectID)).
+			SetQueryParam("type", "0").
+			SetQueryParam("limit", "100").
+			SetQueryParam("offset", fmt.Sprintf("%d", offset)).
+			Get("https://api.bgm.tv/v0/episodes")
+		if err != nil {
+			return nil, fmt.Errorf("获取剧集列表失败: %v", err)
+		}
+		if response.IsError() {
+			return nil, fmt.Errorf("Bangumi 剧集接口返回 HTTP %d", response.StatusCode())
+		}
+		episodes = append(episodes, result.Data...)
+		if len(result.Data) < 100 || (result.Total > 0 && len(episodes) >= result.Total) {
+			return episodes, nil
+		}
 	}
-	// API: GET /v0/episodes?subject_id={id}&type=0 (只获取本篇)
-	// 默认 limit=100，对于大多数番剧够用了
-	response, err := b.client.R().
-		SetResult(&result).
-		SetQueryParam("subject_id", fmt.Sprintf("%d", subjectID)).
-		SetQueryParam("type", "0"). // 0 = 本篇
-		SetQueryParam("limit", "100").
-		Get("https://api.bgm.tv/v0/episodes")
-
-	if err != nil {
-		return nil, fmt.Errorf("获取剧集列表失败: %v", err)
-	}
-	if response.IsError() {
-		return nil, fmt.Errorf("Bangumi 剧集接口返回 HTTP %d", response.StatusCode())
-	}
-	return result.Data, nil
+	return nil, fmt.Errorf("Bangumi 剧集列表超过分页上限")
 }
