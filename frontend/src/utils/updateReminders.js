@@ -1,8 +1,5 @@
 const localDay = (milliseconds) => new Date(milliseconds).toDateString();
-const dayStart = (milliseconds, offset = 0) => {
-  const date = new Date(milliseconds);
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + offset).getTime();
-};
+
 
 function update(episode, airingAt) {
   if (!(airingAt > 0)) return null;
@@ -16,13 +13,17 @@ export function rememberUpdates(records, airings, now = Date.now()) {
   for (const id of new Set([...Object.keys(records), ...Object.keys(airings)])) {
     const previous = records[id] || {};
     const record = { ...previous };
+    // Older versions may have persisted a future airing as already updated.
+    if (record.latest?.airingAt * 1000 > now) record.latest = null;
     const airing = airings[id];
     const next = update(airing?.next_episode, airing?.next_airing_at);
     let savedNext = previous.next;
     // Respect a corrected/postponed schedule for the same episode.
     if (next && savedNext?.episode === next.episode) savedNext = next;
-    for (const candidate of [savedNext, update(airing?.today_episode, airing?.today_airing_at), next]) {
-      if (!candidate || dayStart(candidate.airingAt * 1000) > dayStart(now)) continue;
+    if (next && record.latest?.episode === next.episode && next.airingAt * 1000 > now) record.latest = null;
+    for (const observed of [savedNext, update(airing?.today_episode, airing?.today_airing_at), next]) {
+      const candidate = next && observed?.episode === next.episode ? next : observed;
+      if (!candidate || candidate.airingAt * 1000 > now) continue;
       if (!record.latest || candidate.airingAt > record.latest.airingAt ||
           (candidate.airingAt === record.latest.airingAt && candidate.episode > record.latest.episode)) {
         record.latest = candidate;
@@ -48,6 +49,6 @@ export function readUpdate(record = {}, metadataReady = true, now = Date.now()) 
     seenKey: record.latest?.key || record.seenKey || '',
     // A click before metadata arrives also acknowledges older updates discovered
     // by that pending lookup, while retaining the last known update separately.
-    seenThrough: metadataReady ? record.seenThrough || 0 : dayStart(now, 1) - 1,
+    seenThrough: metadataReady ? record.seenThrough || 0 : now,
   };
 }

@@ -49,3 +49,25 @@ test('a second episode on the same day creates a new reminder after reading the 
   records = rememberUpdates(records, { 1: schedule(15, 2) }, time(15));
   assert.equal(hasUnreadUpdate(records[1]), true);
 });
+
+test('today schedule becomes NEW only at the actual airing time', () => {
+ const airing = { 1: { today_episode: 5, today_airing_at: time(16,23)/1000 } };
+ let records = rememberUpdates({}, airing, time(16,9));
+ assert.equal(hasUnreadUpdate(records[1]),false);
+ records[1] = readUpdate(records[1],false,time(16,9));
+ records = rememberUpdates(records,airing,time(16,23));
+ assert.equal(hasUnreadUpdate(records[1]),true);
+});
+
+test('a corrected postponed schedule withdraws a premature update', () => {
+ let records = rememberUpdates({}, { 1: { next_episode:5,next_airing_at:time(16,9)/1000 } },time(16,10));
+ assert.equal(hasUnreadUpdate(records[1]),true);
+ records = rememberUpdates(records, { 1: { next_episode:5,next_airing_at:time(17,23)/1000 } },time(16,11));
+ assert.equal(hasUnreadUpdate(records[1]),false);
+});
+
+test('future badges persisted by older versions are withdrawn until airing', () => {
+ const latest = { episode:5,airingAt:time(16,23)/1000,key:'old' };
+ const records = rememberUpdates({ 1:{ latest } },{},time(16,9));
+ assert.equal(hasUnreadUpdate(records[1]),false);
+});

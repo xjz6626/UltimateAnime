@@ -1,6 +1,7 @@
 package pikpak
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -256,7 +258,7 @@ func TestDownloadFileConcurrentWritesCompleteFile(t *testing.T) {
 		if got := req.Header.Get("Range"); got != "bytes=0-4" {
 			t.Errorf("range = %q", got)
 		}
-		return &http.Response{StatusCode: http.StatusPartialContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("hello")), Request: req}, nil
+		return &http.Response{StatusCode: http.StatusPartialContent, Header: http.Header{"Content-Range": {"bytes 0-4/5"}}, Body: io.NopCloser(strings.NewReader("hello")), Request: req}, nil
 	})
 	if err := client.downloadFileConcurrent("file-id", path, 5, 1, nil, downloadOptions{rangeTransport: rangeTransport}); err != nil {
 		t.Fatal(err)
@@ -288,7 +290,7 @@ func TestDownloadFileConcurrentRefreshesLinkAfterServiceUnavailable(t *testing.T
 			return jsonResponse(req, http.StatusServiceUnavailable, "unavailable"), nil
 		}
 		newRequests++
-		return &http.Response{StatusCode: http.StatusPartialContent, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("hello")), Request: req}, nil
+		return &http.Response{StatusCode: http.StatusPartialContent, Header: http.Header{"Content-Range": {"bytes 0-4/5"}}, Body: io.NopCloser(strings.NewReader("hello")), Request: req}, nil
 	})
 	path := filepath.Join(t.TempDir(), "episode.mkv")
 	err := client.downloadFileConcurrent("file-id", path, 5, 1, nil, downloadOptions{rangeTransport: rangeTransport, retryWait: func(time.Duration) {}})
@@ -353,5 +355,82 @@ func TestServeStreamForwardsRangeWithoutBrowserCredentials(t *testing.T) {
 	client.ServeStream(response, request)
 	if response.Code != http.StatusPartialContent || response.Body.String() != "h" || response.Header().Get("Content-Range") != "bytes 0-0/5" {
 		t.Fatalf("status=%d body=%q content-range=%q", response.Code, response.Body.String(), response.Header().Get("Content-Range"))
+	}
+}
+
+func TestConcurrentRequestsKeepCaptchaActionLocal(t *testing.T) {
+	client := NewPikPakClient("test@example.com", "password", "")
+	client.Client.SetTransport(mockTransport(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/v1/shield/captcha/init" {
+			var body CaptchaTokenRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+			encoded, _ := json.Marshal(map[string]string{"captcha_token": body.Action})
+			return jsonResponse(req, 200, string(encoded)), nil
+		}
+		token := req.Header.Get("X-Captcha-Token")
+		if token == "" {
+			return jsonResponse(req, 200, `{"error_code":9,"error":"captcha_required"}`), nil
+		}
+		if want := GetAction(req.Method, req.URL.String()); token != want {
+			t.Errorf("captcha %q used for %q", token, want)
+		}
+		return jsonResponse(req, 200, `{"files":[],"tasks":[],"web_content_link":"https://example.test/video"}`), nil
+	}))
+	var group sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		group.Add(1)
+		go func(i int) {
+			defer group.Done()
+			var err error
+			switch i % 3 {
+			case 0:
+				_, err = client.FileList("")
+			case 1:
+				_, err = client.GetDownloadUrl(fmt.Sprint(i))
+			case 2:
+				_, err = client.OfflineList(true)
+			}
+			if err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	group.Wait()
+}
+
+func TestDownloadCancellationStopsMediaRequest(t *testing.T) {
+	client := NewPikPakClient("test", "password", "")
+	client.Client.SetTransport(mockTransport(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "captcha") {
+			return jsonResponse(req, 200, `{"captcha_token":"captcha"}`), nil
+		}
+		return jsonResponse(req, 200, `{"web_content_link":"https://media.test/video"}`), nil
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	output := filepath.Join(t.TempDir(), "video.mkv")
+	done := make(chan error, 1)
+	go func() {
+		done <- client.downloadFileConcurrent("video", output, 5, 1, nil, downloadOptions{context: ctx, rangeTransport: mockTransport(func(req *http.Request) (*http.Response, error) {
+			close(started)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		})})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled download succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not stop media transfer")
+	}
+	if _, err := os.Stat(output); !os.IsNotExist(err) {
+		t.Fatal("partial download published")
 	}
 }

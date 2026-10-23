@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,5 +34,40 @@ func TestEpisodesLoadsBeyondFirstHundred(t *testing.T) {
 	episodes, err := client.GetSubjectEpisodes(42)
 	if err != nil || len(episodes) != 102 || episodes[101].Sort != 102 || len(offsets) != 2 || offsets[1] != 100 {
 		t.Fatalf("pagination: episodes=%d offsets=%v error=%v", len(episodes), offsets, err)
+	}
+}
+
+func TestConfigureClearsAuthorizationAndAppliesProxy(t *testing.T) {
+	client := NewClient("old-token", "")
+	client.Configure("", "http://127.0.0.1:7890")
+	if client.Token != "" || client.client.Header.Get("Authorization") != "" {
+		t.Fatal("stale authorization retained")
+	}
+	proxy, err := client.client.GetClient().Transport.(*http.Transport).Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "api.bgm.tv"}})
+	if err != nil || proxy.String() != "http://127.0.0.1:7890" {
+		t.Fatalf("proxy=%v err=%v", proxy, err)
+	}
+	client.Configure("new-token", "")
+	if client.client.Header.Get("Authorization") != "Bearer new-token" {
+		t.Fatal("token not updated")
+	}
+}
+
+func TestNextRequestHasNoTokenAfterClear(t *testing.T) {
+	client := NewClient("old-token", "")
+	headers := []string{}
+	client.client.SetTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		headers = append(headers, r.Header.Get("Authorization"))
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+	}))
+	if _, err := client.GetSubject(1); err != nil {
+		t.Fatal(err)
+	}
+	client.Configure("", "")
+	if _, err := client.GetSubject(1); err != nil {
+		t.Fatal(err)
+	}
+	if len(headers) != 2 || headers[0] != "Bearer old-token" || headers[1] != "" {
+		t.Fatalf("authorization: %q", headers)
 	}
 }

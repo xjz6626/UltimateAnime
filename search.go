@@ -14,7 +14,7 @@ func (a *App) episodeSearchKeywords(subjectID int, custom string) ([]string, err
 	if custom = strings.TrimSpace(custom); custom != "" {
 		return []string{custom}, nil
 	}
-	for _, follow := range a.GetLocalFollows() {
+	for _, follow := range a.librarySnapshot() {
 		if follow.SubjectID != subjectID {
 			continue
 		}

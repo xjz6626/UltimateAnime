@@ -2,12 +2,14 @@ package bangumi
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-resty/resty/v2"
 )
 
 type BangumiClient struct {
+	mu     sync.RWMutex
 	client *resty.Client
 	Token  string
 }
@@ -42,6 +44,8 @@ func NewClient(token, proxy string) *BangumiClient {
 
 // SetToken 更新 Token
 func (b *BangumiClient) SetToken(token string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.Token = token
 	if token != "" {
 		b.client.SetHeader("Authorization", "Bearer "+token)
@@ -145,6 +149,8 @@ type Episode struct {
 
 // GetCalendar 获取每日放送表 (对应 bangumi_api.py 中的功能)
 func (b *BangumiClient) GetCalendar() ([]CalendarItem, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var result []CalendarItem
 	// API: GET /calendar
 	response, err := b.client.R().
@@ -162,6 +168,8 @@ func (b *BangumiClient) GetCalendar() ([]CalendarItem, error) {
 
 // SearchSubject 搜索番剧
 func (b *BangumiClient) SearchSubject(keywords string) ([]Subject, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var result SearchResult
 	// API: GET /search/subject/{keywords}?type=2 (2代表动画)
 	_, err := b.client.R().
@@ -178,6 +186,8 @@ func (b *BangumiClient) SearchSubject(keywords string) ([]Subject, error) {
 
 // GetSubject 获取指定番剧详情
 func (b *BangumiClient) GetSubject(subjectID int) (*Subject, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var result Subject
 	_, err := b.client.R().
 		SetResult(&result).
@@ -191,6 +201,8 @@ func (b *BangumiClient) GetSubject(subjectID int) (*Subject, error) {
 
 // GetUserCollection 获取用户在看列表
 func (b *BangumiClient) GetUserCollection(uid string) ([]UserCollection, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var result struct {
 		Data []UserCollection `json:"data"`
 	}
@@ -212,6 +224,8 @@ func (b *BangumiClient) GetUserCollection(uid string) ([]UserCollection, error) 
 // UpdateCollectionStatus 更新收藏状态
 // status: 1=想看, 2=看过, 3=在看, 4=搁置, 5=抛弃
 func (b *BangumiClient) UpdateCollectionStatus(subjectID int, status int) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	// API: POST /v0/users/-/collections/{subject_id}
 	// Body: {"type": status}
 	body := map[string]int{
@@ -233,6 +247,8 @@ func (b *BangumiClient) UpdateCollectionStatus(subjectID int, status int) error 
 
 // GetSubjectDetail 获取番剧详情
 func (b *BangumiClient) GetSubjectDetail(subjectID int) (*SubjectDetail, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var result SubjectDetail
 	// API: GET /v0/subjects/{subject_id}
 	response, err := b.client.R().
@@ -250,6 +266,8 @@ func (b *BangumiClient) GetSubjectDetail(subjectID int) (*SubjectDetail, error) 
 
 // GetSubjectEpisodes 获取番剧剧集列表
 func (b *BangumiClient) GetSubjectEpisodes(subjectID int) ([]Episode, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	var episodes []Episode
 	for offset := 0; offset < 20000; offset += 100 {
 		var result struct {
@@ -275,4 +293,19 @@ func (b *BangumiClient) GetSubjectEpisodes(subjectID int) ([]Episode, error) {
 		}
 	}
 	return nil, fmt.Errorf("Bangumi 剧集列表超过分页上限")
+}
+
+func (b *BangumiClient) Configure(token, proxy string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.Token = token
+	b.client.Header.Del("Authorization")
+	if token != "" {
+		b.client.SetHeader("Authorization", "Bearer "+token)
+	}
+	if proxy == "" {
+		b.client.RemoveProxy()
+	} else {
+		b.client.SetProxy(proxy)
+	}
 }

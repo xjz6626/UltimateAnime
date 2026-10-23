@@ -28,7 +28,8 @@ func main() {
 		Debug: options.Debug{
 			OpenInspectorOnStartup: true, // 启动时自动打开 DevTools
 		},
-		OnStartup: app.startup,
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
 		Bind: []interface{}{
 			app,
 		},

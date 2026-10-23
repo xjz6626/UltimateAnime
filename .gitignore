@@ -33,7 +33,17 @@ Thumbs.db
 
 
 # User Data & Config
+/.aws
 config.json
 followed.json
 Downloads/
 cache/
+
+# Persistent task state and private recovery copies
+downloads.json
+config.json.bak
+followed.json.bak
+downloads.json.bak
+*.ua.part
+*.ua.resume.json
+*.ua.resume.json.bak

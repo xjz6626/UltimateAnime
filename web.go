@@ -266,11 +266,11 @@ func (a *App) webCallContext(ctx context.Context, method string, args []json.Raw
 			return nil, err
 		}
 		return a.GetBangumiCalendar()
-	case "GetLocalFollows":
+	case "GetLocalFollows", "GetLocalFollowsChecked":
 		if err := webArgs(args); err != nil {
 			return nil, err
 		}
-		return a.GetLocalFollows(), nil
+		return a.GetLocalFollowsChecked()
 	case "GetFollowAirings":
 		if err := webArgs(args); err != nil {
 			return nil, err
@@ -344,6 +344,36 @@ func (a *App) webCallContext(ctx context.Context, method string, args []json.Raw
 			return nil, err
 		}
 		return a.SaveEpisodeMagnet(id, episode, magnet), nil
+	case "GetDownloadTasks":
+		if err := webArgs(args); err != nil {
+			return nil, err
+		}
+		return a.GetDownloadTasks()
+	case "RetryDownload", "PauseDownload", "CancelDownload":
+		var id string
+		if err := webArgs(args, &id); err != nil {
+			return nil, err
+		}
+		switch method {
+		case "PauseDownload":
+			return a.PauseDownload(id), nil
+		case "CancelDownload":
+			return a.CancelDownload(id), nil
+		default:
+			return a.RetryDownload(id), nil
+		}
+	case "GetContinueWatching":
+		if err := webArgs(args); err != nil {
+			return nil, err
+		}
+		return a.GetContinueWatching()
+	case "HideContinueWatching":
+		var id int
+		var episode float64
+		if err := webArgs(args, &id, &episode); err != nil {
+			return nil, err
+		}
+		return a.HideContinueWatching(id, episode), nil
 	case "DownloadEpisode":
 		var id int
 		var episode float64

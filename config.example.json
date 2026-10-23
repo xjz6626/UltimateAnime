@@ -21,6 +21,7 @@
     "bilibili_cookie": ""
   },
   "player": {
+    "auto_next": false,
     "mpv_path": "",
     "mpv_args": ""
   }

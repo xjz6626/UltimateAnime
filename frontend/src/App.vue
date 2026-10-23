@@ -21,6 +21,7 @@
           <span class="mr-3 text-xl group-hover:scale-110 transition-transform">⚙️</span>
           <span class="font-medium">系统设置</span>
         </router-link>
+        <router-link to="/downloads" class="nav-item" active-class="active"><span class="mr-3 text-xl">⬇️</span><span class="font-medium">下载任务</span></router-link>
         <router-link to="/logs" class="nav-item group" active-class="active">
           <span class="mr-3 text-xl group-hover:scale-110 transition-transform">📜</span>
           <span class="font-medium">运行日志</span>
@@ -50,6 +51,7 @@
 
     <DanmakuPicker />
     <main class="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain bg-gray-900">
+      <NextPlaybackBanner v-if="!isWebMode()" />
       <router-view v-slot="{ Component }">
         <transition name="fade" mode="out-in">
           <component :is="Component" />
@@ -57,13 +59,14 @@
       </router-view>
     </main>
 
-    <nav v-if="isWebMode()" class="mobile-nav grid shrink-0 grid-cols-3 border-t border-gray-700 bg-gray-800 lg:hidden" aria-label="主导航">
+    <nav v-if="isWebMode()" class="mobile-nav grid shrink-0 grid-cols-4 border-t border-gray-700 bg-gray-800 lg:hidden" aria-label="主导航">
       <router-link to="/" class="mobile-nav-item" active-class="active">
         <span aria-hidden="true" class="text-xl">📺</span><span>追番</span>
       </router-link>
       <router-link to="/discovery" class="mobile-nav-item" active-class="active">
         <span aria-hidden="true" class="text-xl">📅</span><span>新番</span>
       </router-link>
+      <router-link to="/downloads" class="mobile-nav-item" active-class="active"><span class="text-xl">⬇️</span><span>任务</span></router-link>
       <router-link to="/logs" class="mobile-nav-item" active-class="active">
         <span aria-hidden="true" class="text-xl">📜</span><span>日志</span>
       </router-link>
@@ -75,6 +78,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { EventsOn, GetPikPakStatus, isWebMode } from './api'
 import DanmakuPicker from './components/DanmakuPicker.vue'
+import NextPlaybackBanner from './components/NextPlaybackBanner.vue'
 
 const pikpakStatus = ref("未登录") 
 

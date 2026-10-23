@@ -24,7 +24,7 @@ async function invokeWithSignal(signal, method, ...args) {
 export const GetPikPakStatus = () => invoke('GetPikPakStatus');
 export const GetAutoSelectMagnet = () => invoke('GetAutoSelectMagnet');
 export const GetBangumiCalendar = () => invoke('GetBangumiCalendar');
-export const GetLocalFollows = () => invoke('GetLocalFollows');
+export const GetLocalFollows = () => invoke('GetLocalFollowsChecked');
 export const GetFollowAirings = () => invoke('GetFollowAirings');
 export const GetAnimeDetail = (id) => invoke('GetAnimeDetail', id);
 export const FollowLocal = (item) => invoke('FollowLocal', item);
@@ -36,6 +36,11 @@ export const SaveEpisodeMagnet = (id, episode, magnet) => invoke('SaveEpisodeMag
 export const DownloadEpisode = (id, episode, magnet) => invoke('DownloadEpisode', id, episode, magnet);
 export const PlayMagnet = (magnet) => invoke('PlayMagnet', magnet);
 export const PlayLocalEpisode = (id, episode) => invoke('PlayLocalEpisode', id, episode);
+export const RestartLocalEpisode = (id, episode) => invoke('RestartLocalEpisode', id, episode);
+export const GetContinueWatching = () => invoke('GetContinueWatching');
+export const HideContinueWatching = (id, episode) => invoke('HideContinueWatching', id, episode);
+export const GetNextPlayback = () => invoke('GetNextPlayback');
+export const CancelNextPlayback = () => invoke('CancelNextPlayback');
 export const DeleteEpisodeData = (id, episode) => invoke('DeleteEpisodeData', id, episode);
 export const GetLogs = () => invoke('GetLogs');
 export const GetAppConfig = () => invoke('GetAppConfig');
@@ -108,6 +113,9 @@ export function EventsOn(name, callback) {
   listeners.get(name).add(callback);
   if (!eventSource) {
     eventSource = new EventSource('/api/events');
+    eventSource.addEventListener('open', () => {
+      for (const listener of listeners.get('connection-restored') || []) listener();
+    });
     eventSource.onmessage = (event) => {
       const message = JSON.parse(event.data);
       for (const listener of listeners.get(message.name) || []) {
@@ -123,3 +131,8 @@ export function EventsOn(name, callback) {
     }
   };
 }
+
+export const GetDownloadTasks = () => invoke('GetDownloadTasks');
+export const RetryDownload = (id) => invoke('RetryDownload', id);
+export const PauseDownload = (id) => invoke('PauseDownload', id);
+export const CancelDownload = (id) => invoke('CancelDownload', id);

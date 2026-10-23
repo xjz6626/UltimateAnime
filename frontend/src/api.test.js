@@ -94,3 +94,18 @@ test('canceling web search aborts HTTP and releases its event subscription', asy
   assert.equal(requestSignal.aborted, true);
   assert.equal(events.readyState, 2);
 });
+
+test('SSE reconnect notifies task consumers so they can refresh a snapshot', async () => {
+ const { EventsOn, GetDownloadTasks } = await import('./api.js');
+ globalThis.window = { __ULTIMATEANIME_WEB__: true };
+ globalThis.EventSource = FakeEventSource;
+ let snapshots = 0;
+ globalThis.fetch = async (_url, options) => {
+  assert.equal(JSON.parse(options.body).method, 'GetDownloadTasks'); snapshots++;
+  return { ok: true, json: async () => ({ result: [{ id:'42:1',state:'downloading' }] }) };
+ };
+ const stop = EventsOn('connection-restored', () => GetDownloadTasks());
+ FakeEventSource.latest.open(); await new Promise(setImmediate);
+ FakeEventSource.latest.open(); await new Promise(setImmediate);
+ assert.equal(snapshots,2);stop();
+});

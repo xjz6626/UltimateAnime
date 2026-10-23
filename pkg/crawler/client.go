@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/go-resty/resty/v2"
 )
@@ -90,11 +91,12 @@ type mikanFeed struct {
 }
 
 type TorrentItem struct {
-	Title       string `json:"title"`
-	Magnet      string `json:"magnet"`
-	Size        string `json:"size"`
-	PublishDate string `json:"publish_date"`
-	Source      string `json:"source"`
+	Title        string `json:"title"`
+	Magnet       string `json:"magnet"`
+	Size         string `json:"size"`
+	PublishDate  string `json:"publish_date"`
+	Source       string `json:"source"`
+	MatchWarning string `json:"match_warning,omitempty"`
 }
 
 func parseSize(v interface{}) string {
@@ -128,13 +130,14 @@ func parseSize(v interface{}) string {
 }
 
 var (
-	episodeRange    = regexp.MustCompile(`(?i)(?:\[|【|\b)\d{1,3}\s*[-~～]\s*\d{1,3}(?:\]|】|\b)`)
+	releaseDate     = regexp.MustCompile(`\b(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\b`)
+	episodeRange    = regexp.MustCompile(`(?i)(?:\[|【|\b)\d{1,5}\s*[-~～]\s*\d{1,5}(?:\]|】|\b)`)
 	episodePatterns = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)\bS\d{1,2}E(\d{1,3}(?:\.\d)?)\b`),
-		regexp.MustCompile(`第\s*(\d{1,3}(?:\.\d)?)\s*[话話集]`),
-		regexp.MustCompile(`(?i)[\[【](\d{1,3}(?:\.\d)?)(?:v\d+)?[\]】]`),
-		regexp.MustCompile(`(?:^|\s)-\s*(\d{1,3}(?:\.\d)?)(?:\s|[\[【]|$)`),
-		regexp.MustCompile(`(?:^|[\s._-])(\d{1,3}(?:\.\d)?)(?:[\s._\-\]】]|$)`),
+		regexp.MustCompile(`(?i)\bS\d{1,2}E(\d{1,5}(?:\.\d)?)\b`),
+		regexp.MustCompile(`第\s*(\d{1,5}(?:\.\d)?)\s*[话話集]`),
+		regexp.MustCompile(`(?i)[\[【](\d{1,5}(?:\.\d)?)(?:v\d+)?[\]】]`),
+		regexp.MustCompile(`(?:^|\s)-\s*(\d{1,5}(?:\.\d)?)(?:\s|[\[【]|$)`),
+		regexp.MustCompile(`(?:^|[\s._-])(\d{1,5}(?:\.\d)?)(?:[\s._\-\]】]|$)`),
 	}
 	seasonPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`第\s*([一二三四五六七八九十\d]{1,3})\s*[季期]`),
@@ -147,13 +150,24 @@ var (
 
 // ParseEpisodeNumber rejects multi-episode packs so they cannot be selected automatically.
 func ParseEpisodeNumber(title string) float64 {
+	title = releaseDate.ReplaceAllString(title, " ")
 	if episodeRange.MatchString(title) || strings.Contains(title, "合集") || strings.Contains(strings.ToLower(title), "batch") {
 		return -1
 	}
-	for _, pattern := range episodePatterns {
+	for index, pattern := range episodePatterns {
+		if index == len(episodePatterns)-1 {
+			for _, season := range seasonPatterns {
+				title = season.ReplaceAllString(title, " ")
+			}
+		}
 		for _, match := range pattern.FindAllStringSubmatch(title, -1) {
 			number, err := strconv.ParseFloat(match[1], 64)
-			if err == nil && number > 0 && number <= 200 {
+			if err == nil && number > 0 && number <= 99999 {
+				// Bare numbers can be years, resolutions or encoding labels.
+				// Explicit "第 N 集" and SxxExx have no such ambiguity.
+				if index >= 2 && ((number >= 1900 && number <= 2099) || number == 480 || number == 720 || number == 1080 || number == 2160 || number == 264 || number == 265) {
+					continue
+				}
 				return number
 			}
 		}
@@ -197,12 +211,13 @@ func (c *Crawler) fetchResourcesContext(ctx context.Context, terms []string, onP
 	params := url.Values{"search": terms, "pageSize": {"100"}}
 	c.mu.RLock()
 	apiURL := c.ApiUrl
+	client := c.client
 	c.mu.RUnlock()
 	var all []ResourceItem
 	for page := 1; page <= 3; page++ {
 		params.Set("page", strconv.Itoa(page))
 		var result SearchResp
-		response, err := c.client.R().SetContext(ctx).SetQueryParamsFromValues(params).SetResult(&result).Get(apiURL)
+		response, err := client.R().SetContext(ctx).SetQueryParamsFromValues(params).SetResult(&result).Get(apiURL)
 		if err != nil {
 			if len(all) > 0 {
 				return all, nil
@@ -247,10 +262,13 @@ func (c *Crawler) fetchMikanResources(keyword string) ([]ResourceItem, error) {
 }
 
 func (c *Crawler) fetchMikanResourcesContext(ctx context.Context, keyword string) ([]ResourceItem, error) {
-	if c.mikanURL == "" {
+	c.mu.RLock()
+	mikanURL, client := c.mikanURL, c.mikanClient
+	c.mu.RUnlock()
+	if mikanURL == "" {
 		return nil, nil
 	}
-	response, err := c.mikanClient.R().SetContext(ctx).SetQueryParam("searchstr", keyword).Get(c.mikanURL)
+	response, err := client.R().SetContext(ctx).SetQueryParam("searchstr", keyword).Get(mikanURL)
 	if err != nil {
 		return nil, fmt.Errorf("蜜柑计划搜索请求失败: %w", err)
 	}
@@ -409,7 +427,11 @@ func matchingEpisodes(resources []ResourceItem, episode float64, name string) []
 			continue
 		}
 		seen[key] = true
-		items = append(items, toTorrentItem(resource))
+		item := toTorrentItem(resource)
+		if !automaticIdentityMatch(item.Title, []string{name}) {
+			item.MatchWarning = "作品或季度未能确认，请核对后选择"
+		}
+		items = append(items, item)
 	}
 	sort.SliceStable(items, func(i, j int) bool { return episodeScore(items[i].Title, name) > episodeScore(items[j].Title, name) })
 	return items
@@ -513,5 +535,60 @@ func (c *Crawler) SearchEpisode(keywords []string, episode float64) (*TorrentIte
 	if len(items) == 0 {
 		return nil, fmt.Errorf("未找到第 %g 集的磁力链接", episode)
 	}
-	return &items[0], nil
+	for i := range items {
+		if automaticIdentityMatch(items[i].Title, keywords) {
+			return &items[i], nil
+		}
+	}
+	return nil, fmt.Errorf("候选资源的作品或季度无法确认，请手动选择")
+}
+
+func (c *Crawler) Configure(apiURL, proxy string) {
+	next := NewCrawler(apiURL, proxy)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ApiUrl, c.client, c.mikanClient = next.ApiUrl, next.client, next.mikanClient
+}
+
+// Automatic selection uses full known names, not the fallback search fragments.
+func automaticIdentityMatch(title string, names []string) bool {
+	want := 1
+	for _, name := range names {
+		if season, ok := seasonNumber(name); ok {
+			want = season
+			break
+		}
+	}
+	_, explicit := seasonNumber(title)
+	if !explicit && want != 1 {
+		return false
+	}
+	// Conflicting labels (e.g. "Season 2 S01E01") must never pass by
+	// selecting only the first season marker.
+	for _, pattern := range seasonPatterns {
+		for _, marker := range pattern.FindAllString(title, -1) {
+			if got, ok := seasonNumber(marker); ok && got != want {
+				return false
+			}
+		}
+	}
+	normalize := func(value string) string {
+		for _, pattern := range seasonPatterns {
+			value = pattern.ReplaceAllString(value, " ")
+		}
+		return strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				return unicode.ToLower(r)
+			}
+			return -1
+		}, value)
+	}
+	candidate := normalize(title)
+	for _, name := range names {
+		identity := normalize(name)
+		if len([]rune(identity)) >= 2 && strings.Contains(candidate, identity) {
+			return true
+		}
+	}
+	return false
 }

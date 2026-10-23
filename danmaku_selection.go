@@ -60,7 +60,7 @@ func (a *App) GetEpisodeDanmakuSource(subjectID int, episode float64) (DanmakuSe
 	if err != nil {
 		return DanmakuSelectionContext{}, err
 	}
-	for _, follow := range a.GetLocalFollows() {
+	for _, follow := range a.librarySnapshot() {
 		if follow.SubjectID == subjectID {
 			return DanmakuSelectionContext{Names: []string{follow.NameCN, follow.Name}, Choice: choice}, nil
 		}
@@ -95,7 +95,7 @@ func (a *App) SaveEpisodeDanmakuSource(subjectID int, episode float64, choice Da
 	}
 	var localFile string
 	found := false
-	for _, follow := range a.GetLocalFollows() {
+	for _, follow := range a.librarySnapshot() {
 		if follow.SubjectID == subjectID {
 			found = true
 			localFile = follow.LocalFiles[fmt.Sprint(episode)]
@@ -132,6 +132,9 @@ func (a *App) SaveEpisodeDanmakuSource(subjectID int, episode float64, choice Da
 	if err := a.saveJSONCache(path, choice); err != nil {
 		return "Error: 保存弹幕来源失败"
 	}
+	if localFile != "" && !filepath.IsAbs(localFile) {
+		localFile = filepath.Join(a.dataDir(), localFile)
+	}
 	if localFile != "" && (choice.Kind != previous.Kind || choice.ID != previous.ID || choice.CID != previous.CID) {
 		if err := os.Remove(danmakuPath(localFile)); err != nil && !os.IsNotExist(err) {
 			return "Error: 来源已保存，但清理旧弹幕失败"
@@ -147,7 +150,7 @@ func (a *App) RefreshEpisodeDanmaku(subjectID int, episode float64) string {
 	if _, err := a.danmakuChoicePath(subjectID, episode); err != nil {
 		return "Error: " + err.Error()
 	}
-	for _, follow := range a.GetLocalFollows() {
+	for _, follow := range a.librarySnapshot() {
 		if follow.SubjectID != subjectID {
 			continue
 		}
@@ -155,8 +158,18 @@ func (a *App) RefreshEpisodeDanmaku(subjectID int, episode float64) string {
 		if file == "" {
 			return "Success"
 		} // Selection will apply when the video is downloaded.
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(a.dataDir(), file)
+		}
 		if _, err := os.Stat(file); err != nil {
 			return "Error: 本地视频不存在"
+		}
+		a.downloadMu.Lock()
+		task, tracked := a.downloads[downloadKey(subjectID, episode)]
+		a.downloadMu.Unlock()
+		if tracked && task.Path == file {
+			a.startTaskDanmaku(task, true)
+			return "Started"
 		}
 		go func() {
 			ctx, cancel := a.bilibiliContext()

@@ -68,6 +68,8 @@
                     <span v-if="item.is_collected">❤️ 已追番</span>
                     <span v-else>🤍 追番</span>
                   </button>
+                  <button @click="episodeAction = ep" :aria-label="`第 ${ep.sort} 集操作`" class="rounded bg-gray-800 px-1 text-gray-300">⋯</button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -78,7 +80,7 @@
     </div>
 
     <!-- 详情弹窗 -->
-    <div v-if="selectedItem" class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-0 backdrop-blur-sm sm:p-4" @click="selectedItem = null">
+    <div v-if="selectedItem" class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-0 backdrop-blur-sm sm:p-4" @click="closeDetail()">
       <div class="h-[100dvh] w-full overflow-y-auto overscroll-contain bg-gray-900 shadow-2xl sm:h-auto sm:max-h-[90vh] sm:max-w-4xl sm:rounded-xl sm:border sm:border-gray-700" @click.stop>
         <div v-if="detailLoading" class="p-10 text-center text-gray-400">
           <div class="animate-spin text-4xl mb-4">⏳</div>
@@ -86,14 +88,14 @@
         </div>
         <div v-else-if="detailError" class="p-10 text-center text-red-400">
           <p>获取失败: {{ detailError }}</p>
-          <button @click="selectedItem = null" class="mt-4 px-4 py-2 bg-gray-800 rounded">关闭</button>
+          <button @click="closeDetail()" class="mt-4 px-4 py-2 bg-gray-800 rounded">关闭</button>
         </div>
         <div v-else-if="detailData" class="relative">
           <!-- 顶部大图背景 -->
           <div class="h-32 overflow-hidden relative sm:h-48">
              <img :src="proxyImg(detailData.subject.images.large)" @error="onImgError($event, detailData.subject.images.large)" referrerpolicy="no-referrer" class="w-full object-cover opacity-30 blur-sm transform scale-110">
              <div class="absolute inset-0 bg-gradient-to-b from-transparent to-gray-900"></div>
-             <button @click="selectedItem = null" aria-label="关闭详情" class="absolute top-3 right-3 flex h-11 w-11 items-center justify-center rounded-full bg-black/60 text-white hover:bg-black/80 sm:top-4 sm:right-4">✕</button>
+             <button @click="closeDetail()" aria-label="关闭详情" class="absolute top-3 right-3 flex h-11 w-11 items-center justify-center rounded-full bg-black/60 text-white hover:bg-black/80 sm:top-4 sm:right-4">✕</button>
           </div>
           
           <div class="relative -mt-10 flex flex-col items-start gap-4 px-4 pb-6 sm:-mt-20 sm:gap-6 sm:px-8 sm:pb-8 md:flex-row">
@@ -127,17 +129,20 @@
                 <p class="text-gray-400 text-sm leading-relaxed max-h-32 overflow-y-auto pr-2">{{ detailData.subject.summary || '暂无简介' }}</p>
               </div>
 
+              <button @click="toggleFollow" class="mb-4 mr-3 min-h-[44px] rounded border border-pink-500/40 bg-gray-800 px-4 text-sm text-pink-300">{{ detailData.is_followed ? '取消追番（保留记录）' : '追番' }}</button>
               <button @click="requestDanmakuSource(detailData.subject.id, detailData.episodes[0]?.sort || 1, true, detailData.episodes)" class="mb-4 min-h-[44px] rounded border border-pink-500/40 bg-gray-800 px-4 text-sm text-pink-300">💬 选择／更换 B 站弹幕</button>
 
               <!-- 剧集列表预览 -->
               <div>
                 <h3 class="text-lg font-bold text-white mb-3">剧集列表 <span class="text-xs font-normal text-gray-500 ml-2" v-if="isWebMode()"><span class="lg:hidden">点按集数选择下载或标记观看</span><span class="hidden lg:inline">左键下载，右键标记观看</span></span><span v-else class="text-xs font-normal text-gray-500 ml-2">左键播放/下载，右键标记观看，中键删除</span></h3>
                 <div class="grid grid-cols-4 gap-2 overflow-y-auto pr-2 sm:grid-cols-4 md:max-h-40 md:grid-cols-6">
-                  <div v-for="ep in detailData.episodes" :key="ep.id" 
+                  <div v-for="ep in detailData.episodes" :key="ep.id || ep.sort" class="flex min-w-0 gap-0.5">
+                  <button type="button"
                        @click="handleEpisodeTap(ep, $event)"
                        @contextmenu.prevent="handleEpisodeContext(ep)"
                        @mousedown.middle.prevent="handleEpisodeDelete(ep)"
-                       class="relative flex min-h-[44px] cursor-pointer items-center justify-center truncate rounded border border-transparent px-2 py-1.5 text-center text-sm transition-colors md:min-h-0 md:text-xs"
+                       @keydown.enter.prevent="episodeAction = ep"
+                       class="relative min-w-0 flex-1 flex min-h-[44px] cursor-pointer items-center justify-center truncate rounded border border-transparent px-2 py-1.5 text-center text-sm transition-colors md:min-h-0 md:text-xs"
                        :class="getEpisodeClass(ep)"
                        :title="ep.name_cn || ep.name"
                   >
@@ -145,7 +150,9 @@
                     <!-- 磁力链接指示器 -->
                     <div v-if="detailData.episode_magnets && detailData.episode_magnets[ep.sort]" 
                          class="absolute top-0.5 right-0.5 w-1.5 h-1.5 bg-blue-400 rounded-full shadow-sm"></div>
-                  </div>
+                    <span v-if="watched(ep)" aria-label="已观看" class="absolute left-1 top-0 text-xs">✓</span>
+                    <span v-if="downloaded(ep)" aria-label="已下载" class="absolute bottom-0 right-1 text-xs">↓</span>
+                  </button>
                 </div>
               </div>
             </div>
@@ -192,6 +199,7 @@
           </div>
 
           <p v-if="magnetSearching && magnetCandidates.length" role="status" class="mb-3 text-sm text-gray-400">已找到 {{ magnetCandidates.length }} 项，仍在搜索其他资源…</p>
+          <p v-if="operationMessage" role="status" class="mb-3 text-sm text-amber-300">{{ operationMessage }}</p>
           <p v-if="magnetSearchError" role="alert" class="mb-3 text-sm text-red-400">{{ magnetSearchError }}</p>
           <div v-if="magnetCandidates.length" class="space-y-2">
             <div 
@@ -203,6 +211,7 @@
               <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div class="flex-1 min-w-0">
                   <h3 class="text-white font-medium mb-2 break-words">{{ item.title }}</h3>
+                  <p v-if="item.match_warning" class="mb-2 text-sm text-amber-300">{{ item.match_warning }}</p>
                   <div class="flex flex-wrap gap-3 text-xs text-gray-400">
                     <span>📦 {{ item.size }}</span>
                     <span>👤 {{ item.source }}</span>
@@ -225,9 +234,12 @@
           <h3 class="min-w-0 truncate text-lg font-bold">第 {{ episodeAction.sort }} 集 {{ episodeAction.name_cn || episodeAction.name }}</h3>
           <button @click="episodeAction = null" aria-label="关闭剧集操作" class="h-11 w-11 shrink-0 rounded-full bg-gray-700 text-xl">✕</button>
         </div>
-        <p v-if="episodeAction.sort > detailData.current_episode" class="rounded-lg bg-gray-700 p-3 text-center text-gray-300">这一集尚未播出</p>
-        <div v-else class="space-y-3">
-          <button @click="downloadSelectedEpisode" class="min-h-[48px] w-full rounded-lg bg-pink-600 px-4 font-bold text-white">{{ detailData?.downloaded_eps?.includes(episodeAction.sort) ? '已下载到家中电脑' : '下载／选择资源' }}</button>
+        <p v-if="!available(episodeAction)" class="rounded-lg bg-gray-700 p-3 text-center text-gray-300">暂无已播信息，可手动搜索资源</p>
+        <div class="space-y-3">
+          <button v-if="available(episodeAction)" @click="downloadSelectedEpisode" class="min-h-[48px] w-full rounded-lg bg-pink-600 px-4 font-bold text-white">{{ detailData?.downloaded_eps?.includes(episodeAction.sort) ? (isWebMode() ? '已下载到家中电脑' : '播放本地视频') : '下载／选择资源' }}</button>
+          <button v-if="!isWebMode() && downloaded(episodeAction)" @click="restartSelectedEpisode" class="min-h-[48px] w-full rounded-lg bg-gray-700 px-4 text-white">从头播放</button>
+          <button v-if="!isWebMode()" @click="handleEpisodeDelete(episodeAction); episodeAction = null" class="min-h-[48px] w-full rounded-lg bg-gray-700 px-4 text-red-300">删除本地视频与磁力</button>
+          <button @click="searchSelectedEpisode" class="min-h-[48px] w-full rounded-lg bg-gray-700 px-4 text-white">手动搜索资源</button>
           <button @click="markSelectedEpisode" class="min-h-[48px] w-full rounded-lg bg-gray-700 px-4 font-bold text-white">{{ detailData?.watched_eps?.includes(episodeAction.sort) ? '取消已观看' : '标记已观看' }}</button>
         </div>
       </div>
@@ -236,11 +248,11 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue';
-import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, GetAnimeDetail, ToggleEpisodeWatched, SearchEpisodeMagnet, GetAutoSelectMagnet, PlayMagnet, PlayLocalEpisode, DeleteEpisodeData, SaveEpisodeMagnet, EventsOn, isWebMode } from '../api';
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue';
+import { GetBangumiCalendar, FollowLocal, UnfollowLocal, GetLocalFollows, EventsOn, isWebMode } from '../api';
 import { proxyImg } from '../utils/image';
-import { useMagnetSearch } from '../composables/useMagnetSearch';
-import { downloadWithDanmaku as DownloadEpisode, requestDanmakuSource } from '../composables/useDanmakuPicker';
+import { useAnimeDetail } from '../composables/useAnimeDetail';
+import { requestDanmakuSource } from '../composables/useDanmakuPicker';
 
 const calendar = ref([]);
 const formatAirTime = (timestamp) => new Date(timestamp * 1000).toLocaleString('zh-CN', {
@@ -265,320 +277,16 @@ const selectDay = (id) => {
   scrollToActiveDay();
 };
 
-// 详情弹窗相关
-const selectedItem = ref(null);
-const detailLoading = ref(false);
-const detailData = ref(null);
-const detailError = ref('');
-
-// 磁力选择弹窗相关
-const showMagnetPicker = ref(false);
-const episodeAction = ref(null);
-const magnetPickerEp = ref(null);
-const magnetSearchKeyword = ref('');
-const { searching: magnetSearching, candidates: magnetCandidates, error: magnetSearchError, search: runMagnetSearch, cancel: cancelMagnetSearch } = useMagnetSearch();
-watch(showMagnetPicker, (open) => { if (!open) cancelMagnetSearch(); });
-const episodeClickPending = ref({});
-
-// 代理也加载失败时，回退到原始 URL 再尝试一次（万一用户的网络能直连呢）
+const {
+ operationMessage, toggleFollow, selectedItem, detailData, detailLoading, detailError, showDetail, closeDetail,
+ showMagnetPicker, episodeAction, magnetPickerEp, magnetSearchKeyword, magnetSearching, magnetCandidates, magnetSearchError,
+ getEpisodeClass, available, downloaded, watched, searchMagnetList, selectMagnet, handleEpisodeTap, handleEpisodeContext,
+ handleEpisodeDelete, downloadSelectedEpisode, restartSelectedEpisode, markSelectedEpisode, searchSelectedEpisode,
+} = useAnimeDetail(undefined, () => fetchCalendar());
 const onImgError = (event, originalUrl) => {
-  const img = event.target;
-  if (!img || !originalUrl) return;
-  // 标记一下，防止无限循环回退
-  if (img.dataset.fallback === '1') return;
-  img.dataset.fallback = '1';
-  const httpsUrl = originalUrl.replace(/^http:\/\//i, 'https://');
-  if (img.src !== httpsUrl) {
-    img.src = httpsUrl;
-  }
-};
-
-const showDetail = async (item) => {
-  episodeAction.value = null;
-  selectedItem.value = item;
-  detailLoading.value = true;
-  detailError.value = '';
-  detailData.value = null;
-  
-  try {
-    const res = await GetAnimeDetail(item.id);
-    detailData.value = res;
-  } catch (e) {
-    detailError.value = e.toString();
-  } finally {
-    detailLoading.value = false;
-  }
-};
-
-const getEpisodeClass = (ep) => {
-  if (!detailData.value) return '';
-  
-  // 1. 未放送 (灰色)
-  if (ep.sort > detailData.value.current_episode) {
-    return 'bg-gray-800 text-gray-600 cursor-not-allowed';
-  }
-
-  // 2. 已下载 (蓝色)
-  if (detailData.value.downloaded_eps && detailData.value.downloaded_eps.includes(ep.sort)) {
-    return 'bg-blue-600 text-white hover:bg-blue-700 border border-blue-400';
-  }
-
-  // 3. 已观看 (绿色)
-  if (detailData.value.watched_eps && detailData.value.watched_eps.includes(ep.sort)) {
-    return 'bg-green-600 text-white hover:bg-green-700';
-  }
-
-  // 4. 已放送但未观看 (粉色)
-  return 'bg-pink-600 text-white hover:bg-pink-700';
-};
-
-const toggleWatched = async (ep) => {
-  if (!detailData.value) return;
-  
-  // 如果未放送，不可点击
-  if (ep.sort > detailData.value.current_episode) return;
-
-  // 如果未追番，提示先追番
-  if (!detailData.value.is_followed) {
-    // 自动追番? 或者提示
-    if (confirm("需要先追番才能记录进度，是否立即追番？")) {
-        await toggleCollection(selectedItem.value);
-        // 刷新详情以获取最新的 is_followed 状态
-        const res = await GetAnimeDetail(selectedItem.value.id);
-        detailData.value = res;
-    } else {
-        return;
-    }
-  }
-
-  try {
-    const res = await ToggleEpisodeWatched(detailData.value.subject.id, ep.sort);
-    if (res === "Success") {
-        // 更新本地状态
-        let watched = detailData.value.watched_eps || [];
-        if (watched.includes(ep.sort)) {
-            watched = watched.filter(s => s !== ep.sort);
-        } else {
-            watched.push(ep.sort);
-        }
-        detailData.value.watched_eps = watched;
-    } else {
-        // alert("操作失败: " + res);
-    }
-  } catch (e) {
-    console.error(e);
-  }
-};
-
-const getMagnet = async (ep) => {
-  if (!detailData.value.is_followed) {
-      alert("请先追番");
-      return "";
-  }
-  
-  const epKey = ep.sort.toString();
-  if (detailData.value.episode_magnets && detailData.value.episode_magnets[epKey]) {
-      return detailData.value.episode_magnets[epKey];
-  }
-  
-  try {
-      console.log(`正在搜索第 ${ep.sort} 集...`);
-      const res = await SearchEpisodeMagnet(detailData.value.subject.id, ep.sort);
-      if (typeof res !== 'string' || !res.startsWith('magnet:')) {
-          alert(res);
-          return "";
-      }
-      
-      // 更新本地数据
-      if (!detailData.value.episode_magnets) {
-          detailData.value.episode_magnets = {};
-      }
-      detailData.value.episode_magnets[epKey] = res;
-      return res;
-  } catch (e) {
-      alert("搜索出错: " + e);
-      return "";
-  }
-};
-
-const handleEpisodeClick = async (ep, event) => {
-    if (!detailData.value) return;
-    if (!detailData.value.is_followed) {
-        alert('请先追番，再下载这一集');
-        return;
-    }
-    
-    // 1. 如果已下载，直接播放本地文件
-    if (detailData.value.downloaded_eps && detailData.value.downloaded_eps.includes(ep.sort)) {
-        if (isWebMode()) {
-            alert('这一集已下载到家里的电脑');
-            return;
-        }
-        try {
-            console.log("正在请求播放本地文件...");
-            const res = await PlayLocalEpisode(detailData.value.subject.id, ep.sort);
-            
-            if (res === "Error: FileMissing") {
-                // 文件丢失，自动触发下载
-                console.log("文件丢失，尝试重新下载...");
-                
-                // 更新 UI 状态 (移除已下载标记)
-                detailData.value.downloaded_eps = detailData.value.downloaded_eps.filter(s => s !== ep.sort);
-                
-                await startEpisodeDownload(ep);
-                return;
-            }
-
-            if (res !== "Success") {
-                alert(res);
-            }
-        } catch (e) {
-            alert("播放请求失败: " + e);
-        }
-        return;
-    }
-    
-    // 2. 未下载时按配置选择磁力并开始下载
-    await startEpisodeDownload(ep);
-};
-
-const usesMobileWebActions = () => isWebMode() && window.matchMedia('(max-width: 1023px)').matches;
-const handleEpisodeTap = (ep, event) => {
-  if (usesMobileWebActions()) {
-    episodeAction.value = ep;
-  } else {
-    handleEpisodeClick(ep, event);
-  }
-};
-const handleEpisodeContext = (ep) => {
-  if (usesMobileWebActions()) {
-    episodeAction.value = ep;
-  } else {
-    toggleWatched(ep);
-  }
-};
-const downloadSelectedEpisode = () => {
-  const ep = episodeAction.value;
-  episodeAction.value = null;
-  if (ep) handleEpisodeClick(ep);
-};
-const markSelectedEpisode = () => {
-  const ep = episodeAction.value;
-  episodeAction.value = null;
-  if (ep) toggleWatched(ep);
-};
-
-const openMagnetPicker = async (ep) => {
-    magnetPickerEp.value = ep;
-    magnetSearchKeyword.value = '';
-    showMagnetPicker.value = true;
-    await searchMagnetList();
-};
-
-const startEpisodeDownload = async (ep) => {
-  const epKey = ep.sort.toString();
-  if (episodeClickPending.value[epKey]) return;
-  episodeClickPending.value[epKey] = true;
-  try {
-    const autoSelect = await GetAutoSelectMagnet();
-    if (!autoSelect) {
-      await openMagnetPicker(ep);
-      return;
-    }
-    const magnet = await getMagnet(ep);
-    if (!magnet) {
-      await openMagnetPicker(ep);
-      return;
-    }
-    const res = await DownloadEpisode(detailData.value.subject.id, ep.sort, magnet);
-    if (res === 'Started') {
-      alert(`已自动优选并开始下载第 ${ep.sort} 集`);
-    } else if (res !== 'Cancelled') {
-      alert(res);
-    }
-  } catch (e) {
-    alert('准备下载失败: ' + e);
-  } finally {
-    delete episodeClickPending.value[epKey];
-  }
-};
-
-const searchMagnetList = async () => {
-  if (!detailData.value || !magnetPickerEp.value) return;
-  await runMagnetSearch(detailData.value.subject.id, magnetPickerEp.value.sort, magnetSearchKeyword.value);
-};
-
-const selectMagnet = async (item) => {
-  if (!detailData.value || !magnetPickerEp.value) return;
-  cancelMagnetSearch();
-  
-  // 保存磁力到本地
-  try {
-    const saved = await SaveEpisodeMagnet(detailData.value.subject.id, magnetPickerEp.value.sort, item.magnet);
-    if (saved !== 'Success') {
-      alert('保存磁力链接失败: ' + saved);
-      return;
-    }
-    
-    // 更新 UI
-    const epKey = magnetPickerEp.value.sort.toString();
-    if (!detailData.value.episode_magnets) {
-      detailData.value.episode_magnets = {};
-    }
-    detailData.value.episode_magnets[epKey] = item.magnet;
-    
-    // 开始下载
-    const res = await DownloadEpisode(detailData.value.subject.id, magnetPickerEp.value.sort, item.magnet);
-    if (res === "Started") {
-      alert("已开始下载: " + item.title);
-      showMagnetPicker.value = false;
-    } else if (res !== 'Cancelled') {
-      alert(res);
-    }
-  } catch (e) {
-    alert("操作失败: " + e);
-  }
-};
-
-const handleEpisodeDelete = async (ep) => {
-  if (isWebMode()) return;
-  if (!detailData.value) return;
-  
-  const epKey = ep.sort.toString();
-  const hasMagnet = detailData.value.episode_magnets && detailData.value.episode_magnets[epKey];
-  const hasLocal = detailData.value.downloaded_eps && detailData.value.downloaded_eps.includes(ep.sort);
-  
-  if (!hasMagnet && !hasLocal) {
-    alert("该集没有磁力链接或本地文件");
-    return;
-  }
-  
-  // 构建删除选项提示
-  let options = [];
-  if (hasMagnet) options.push("磁力链接");
-  if (hasLocal) options.push("本地视频");
-  
-  const confirmMsg = `删除第 ${ep.sort} 集的:\n\n${options.join(" + ")}\n\n确定删除吗？`;
-  
-  if (!confirm(confirmMsg)) return;
-  
-  try {
-    const res = await DeleteEpisodeData(detailData.value.subject.id, ep.sort);
-    if (res === "Success") {
-      // 更新本地状态
-      if (hasMagnet && detailData.value.episode_magnets) {
-        delete detailData.value.episode_magnets[epKey];
-      }
-      if (hasLocal && detailData.value.downloaded_eps) {
-        detailData.value.downloaded_eps = detailData.value.downloaded_eps.filter(s => s !== ep.sort);
-      }
-      alert("✅ 删除成功");
-    } else {
-      alert(res);
-    }
-  } catch (e) {
-    alert("删除失败: " + e);
-  }
+ const img = event.target;
+ if (!img || !originalUrl || img.dataset.fallback === '1') return;
+ img.dataset.fallback = '1'; img.src = originalUrl.replace(/^http:\/\//i, 'https://');
 };
 
 // 排序后的日历数据
@@ -662,7 +370,6 @@ const toggleCollection = async (item) => {
 };
 
 let stopDownloadEvents;
-let stopDownloadErrors;
 let refreshTimer;
 onMounted(() => {
   fetchCalendar();
@@ -683,17 +390,12 @@ onMounted(() => {
           }
       }
   });
-  stopDownloadErrors = EventsOn("download-error", (data) => {
-      if (detailData.value?.subject.id === data.subject_id) {
-          alert(`第 ${data.ep_sort} 集下载失败：${data.error}`);
-      }
-  });
+
 });
 onUnmounted(() => {
     clearInterval(refreshTimer);
     stopDownloadEvents?.();
-    stopDownloadErrors?.();
-});
+  });
 </script>
 
 <style scoped>

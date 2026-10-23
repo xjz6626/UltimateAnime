@@ -3,6 +3,7 @@ import Home from '../views/Home.vue'
 import Discovery from '../views/Discovery.vue'
 import Settings from '../views/Settings.vue'
 import Logs from '../views/Logs.vue'
+import Downloads from '../views/Downloads.vue'
 import { isWebMode } from '../api'
 
 const routes = [
@@ -10,6 +11,7 @@ const routes = [
   { path: '/discovery', component: Discovery },
   { path: '/settings', component: Settings },
   { path: '/logs', component: Logs },
+  { path: '/downloads', component: Downloads },
 ]
 
 const router = createRouter({

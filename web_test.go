@@ -117,7 +117,7 @@ func TestWebRPCExposesAutoSelectModeWithoutFullConfig(t *testing.T) {
 	if preferences.Code != http.StatusOK || !strings.Contains(preferences.Body.String(), `"auto_select":false`) || strings.Contains(preferences.Body.String(), "private-cookie") {
 		t.Fatalf("public danmaku preferences: %d %q", preferences.Code, preferences.Body.String())
 	}
-	for _, method := range []string{"StartBilibiliLogin", "PollBilibiliLogin", "GetBilibiliLoginStatus", "ClearBilibiliLogin"} {
+	for _, method := range []string{"StartBilibiliLogin", "PollBilibiliLogin", "GetBilibiliLoginStatus", "ClearBilibiliLogin", "PlayLocalEpisode", "RestartLocalEpisode", "GetNextPlayback", "CancelNextPlayback"} {
 		if response := call(method); response.Code != http.StatusBadRequest {
 			t.Fatalf("login RPC must stay desktop-only: %s", method)
 		}

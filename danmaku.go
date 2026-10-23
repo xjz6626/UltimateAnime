@@ -69,7 +69,7 @@ func (a *App) prepareDanmaku(parent context.Context, subjectID int, epSort float
 func (a *App) downloadEpisodeDanmaku(ctx context.Context, source danmakuSource, subjectID int, epSort float64, video string) error {
 	var names []string
 	year := 0
-	for _, follow := range a.GetLocalFollows() {
+	for _, follow := range a.librarySnapshot() {
 		if follow.SubjectID != subjectID {
 			continue
 		}
@@ -141,6 +141,9 @@ func (a *App) downloadEpisodeDanmaku(ctx context.Context, source danmakuSource, 
 	// publish an ASS if it still belongs to the current selection.
 	a.danmakuMu.Lock()
 	defer a.danmakuMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	choicePath, err := a.danmakuChoicePath(subjectID, epSort)
 	if err != nil {
 		return err

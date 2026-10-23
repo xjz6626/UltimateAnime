@@ -34,6 +34,18 @@ type App struct {
 	imgProxy            *imgproxy.Proxy     // 图片代理服务
 	logHistory          []map[string]string // 日志历史
 	logMu               sync.RWMutex
+	followMu            sync.Mutex
+	downloadMu          sync.Mutex
+	downloads           map[string]DownloadTask
+	downloadDanmaku     map[string]context.CancelFunc
+	downloadSlots       chan struct{}
+	downloadRuns        map[string]*downloadRun
+	workCtx             context.Context
+	workCancel          context.CancelFunc
+	playerMu            sync.Mutex
+	playerSessions      map[string]*playerSession
+	nextPlayback        *NextPlayback
+	nextPlaybackCancel  context.CancelFunc
 	calendarMu          sync.Mutex
 	airingMu            sync.Mutex
 	progressMu          sync.Mutex
@@ -114,8 +126,7 @@ func sanitizePathSegment(name string) string {
 }
 
 func (a *App) getCacheDir() string {
-	cwd, _ := os.Getwd()
-	return filepath.Join(cwd, "cache")
+	return filepath.Join(a.dataDir(), "cache")
 }
 
 func (a *App) loadJSONCache(path string, target any) (bool, error) {
@@ -158,12 +169,11 @@ func NewApp() *App {
 	// 3. 初始化资源爬虫 (复刻 search_torrents.py 的逻辑)
 	// 从配置中读取 torrent_api_url (默认 api.animes.garden)
 	torrentApiUrl := cfgMgr.Data.GlobalSettings.TorrentApiUrl
-	// 用户反馈搜索走代理会导致搜不到中文资源，因此这里强制不使用代理
-	crawlerClient := crawler.NewCrawler(torrentApiUrl, "")
+	// 各数据源统一使用保存的代理配置。
+	crawlerClient := crawler.NewCrawler(torrentApiUrl, proxy)
 
 	// 4. 初始化图片代理服务（用于绕过 Webview 直连 bgm.tv 被切的问题）
-	cwd, _ := os.Getwd()
-	imgProxySvc := imgproxy.New(filepath.Join(cwd, "cache", "images"))
+	imgProxySvc := imgproxy.New(filepath.Join(filepath.Dir(cfgMgr.ConfigPath), "cache", "images"))
 	imgProxySvc.SetProxy(proxy)
 
 	return &App{
@@ -180,6 +190,7 @@ func NewApp() *App {
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.workCtx, a.workCancel = context.WithCancel(ctx)
 	if a.imgProxy != nil {
 		a.imgProxy.Mux().HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
 			client := a.currentPikPakClient()
@@ -198,6 +209,9 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.startWebServer(ctx)
+	if _, err := a.GetDownloadTasks(); err != nil {
+		a.Log("ERROR", "读取下载任务失败: "+err.Error())
+	}
 	go a.refreshCalendarLoop(ctx)
 	a.Log("INFO", "PikPak 将在开始下载时连接")
 }
@@ -460,8 +474,8 @@ func (a *App) UpdateCollectionStatus(subjectID int, status int) string {
 }
 
 // GetAppConfig 获取当前配置
-func (a *App) GetAppConfig() config.AppConfig {
-	return a.configMgr.Snapshot()
+func (a *App) GetAppConfig() (config.AppConfig, error) {
+	return a.configMgr.Snapshot(), a.configMgr.LoadError()
 }
 
 // GetAutoSelectMagnet 只暴露磁力选择模式，网页端无需读取包含账号密码的完整配置。
@@ -473,17 +487,28 @@ func (a *App) GetAutoSelectMagnet() bool {
 func (a *App) SaveAppConfig(jsonStr string) string {
 	a.Log("INFO", "保存配置...")
 	newConfig := config.NewDefaultConfig()
+	if strings.TrimSpace(jsonStr) == "null" {
+		return "Error: 配置不能为空"
+	}
 	if err := json.Unmarshal([]byte(jsonStr), &newConfig); err != nil {
 		return fmt.Sprintf("Error: 解析配置失败 %v", err)
 	}
 
+	if _, err := parsePlayerArgs(newConfig.Player.MPVArgs); err != nil {
+		return "Error: " + err.Error()
+	}
 	a.taskMu.Lock()
 	defer a.taskMu.Unlock()
 	a.loginMu.Lock()
 	defer a.loginMu.Unlock()
 	oldConfig := a.configMgr.Snapshot()
+	newConfig.GlobalSettings.DisabledAccounts = oldConfig.GlobalSettings.DisabledAccounts
+	newConfig.GlobalSettings.QuotaBlockedUntil = oldConfig.GlobalSettings.QuotaBlockedUntil
 	if err := a.configMgr.Replace(newConfig); err != nil {
 		return fmt.Sprintf("Error: 保存文件失败 %v", err)
+	}
+	if !newConfig.Player.AutoNext {
+		a.CancelNextPlayback()
 	}
 	if oldConfig.GlobalSettings.PikPakPassword != newConfig.GlobalSettings.PikPakPassword ||
 		oldConfig.GlobalSettings.Proxy != newConfig.GlobalSettings.Proxy ||
@@ -499,8 +524,8 @@ func (a *App) SaveAppConfig(jsonStr string) string {
 	}
 
 	// 实时应用部分配置
-	if newConfig.GlobalSettings.BangumiApiToken != "" {
-		a.bangumiClient.SetToken(newConfig.GlobalSettings.BangumiApiToken)
+	if a.bangumiClient != nil {
+		a.bangumiClient.Configure(newConfig.GlobalSettings.BangumiApiToken, newConfig.GlobalSettings.Proxy)
 	}
 
 	// 同步更新图片代理的上游代理地址
@@ -508,7 +533,7 @@ func (a *App) SaveAppConfig(jsonStr string) string {
 		a.imgProxy.SetProxy(newConfig.GlobalSettings.Proxy)
 	}
 	if a.crawler != nil {
-		a.crawler.SetAPIURL(newConfig.GlobalSettings.TorrentApiUrl)
+		a.crawler.Configure(newConfig.GlobalSettings.TorrentApiUrl, newConfig.GlobalSettings.Proxy)
 	}
 
 	return "Success"
@@ -516,87 +541,55 @@ func (a *App) SaveAppConfig(jsonStr string) string {
 
 // FollowedItem 本地追番条目
 type FollowedItem struct {
-	SubjectID      int               `json:"subject_id"`
-	Name           string            `json:"name"`
-	NameCN         string            `json:"name_cn"`
-	Image          string            `json:"image"`
-	AirDate        string            `json:"air_date"`
-	AddedAt        string            `json:"added_at"`
-	WatchedEps     []float64         `json:"watched_eps"`     // 已观看的集数 (Sort)
-	DownloadedEps  []float64         `json:"downloaded_eps"`  // 已下载的集数 (Sort)
-	EpisodeMagnets map[string]string `json:"episode_magnets"` // 集数对应的磁力链接 (key: sort, value: magnet)
-	LocalFiles     map[string]string `json:"local_files"`     // 本地文件路径 (key: sort, value: path)
+	SubjectID      int                         `json:"subject_id"`
+	Name           string                      `json:"name"`
+	NameCN         string                      `json:"name_cn"`
+	Image          string                      `json:"image"`
+	AirDate        string                      `json:"air_date"`
+	AddedAt        string                      `json:"added_at"`
+	Playback       map[string]PlaybackProgress `json:"playback,omitempty"`
+	WatchOverrides map[string]bool             `json:"watch_overrides,omitempty"`
+	Archived       bool                        `json:"archived,omitempty"`
+	WatchedEps     []float64                   `json:"watched_eps"`     // 已观看的集数 (Sort)
+	DownloadedEps  []float64                   `json:"downloaded_eps"`  // 已下载的集数 (Sort)
+	EpisodeMagnets map[string]string           `json:"episode_magnets"` // 集数对应的磁力链接 (key: sort, value: magnet)
+	LocalFiles     map[string]string           `json:"local_files"`     // 本地文件路径 (key: sort, value: path)
 }
 
-// FollowLocal 添加本地追番
+// FollowLocal restores a collection without discarding its media or history.
 func (a *App) FollowLocal(item bangumi.Subject) string {
-	a.Log("INFO", fmt.Sprintf("添加本地追番: %s", item.Name))
-
-	// 读取现有列表
-	list := a.GetLocalFollows()
-
-	// 查重
-	for _, v := range list {
-		if v.SubjectID == item.ID {
-			return "Already followed"
+	if item.ID <= 0 {
+		return "Error: 无效的番剧 ID"
+	}
+	return a.updateLibrary(func(list *[]FollowedItem) error {
+		for i := range *list {
+			if (*list)[i].SubjectID == item.ID {
+				(*list)[i].Archived = false
+				return nil
+			}
 		}
-	}
-
-	// 构造新条目
-	newItem := FollowedItem{
-		SubjectID:      item.ID,
-		Name:           item.Name,
-		NameCN:         item.NameCN,
-		Image:          item.Images.Large, // 优先用 Large (高清)
-		AirDate:        item.AirDate,
-		AddedAt:        time.Now().Format("2006-01-02 15:04:05"),
-		WatchedEps:     []float64{},
-		DownloadedEps:  []float64{},
-		EpisodeMagnets: make(map[string]string),
-		LocalFiles:     make(map[string]string),
-	}
-	if newItem.Image == "" {
-		newItem.Image = item.Images.Common
-	}
-
-	list = append(list, newItem)
-	return a.saveFollowedList(list)
+		image := item.Images.Large
+		if image == "" {
+			image = item.Images.Common
+		}
+		*list = append(*list, FollowedItem{SubjectID: item.ID, Name: item.Name, NameCN: item.NameCN, Image: image, AirDate: item.AirDate, AddedAt: time.Now().Format("2006-01-02 15:04:05"), WatchedEps: []float64{}, DownloadedEps: []float64{}, EpisodeMagnets: map[string]string{}, LocalFiles: map[string]string{}})
+		return nil
+	})
 }
 
-// ToggleEpisodeWatched 切换集数观看状态
 func (a *App) ToggleEpisodeWatched(subjectID int, epSort float64) string {
-	a.Log("INFO", fmt.Sprintf("切换观看状态: ID=%d, Ep=%v", subjectID, epSort))
-
-	list := a.GetLocalFollows()
-	found := false
-
-	for i, v := range list {
-		if v.SubjectID == subjectID {
-			found = true
-			// 检查是否已观看
-			isWatched := false
-			newWatched := []float64{}
-			for _, s := range v.WatchedEps {
-				if s == epSort {
-					isWatched = true
-				} else {
-					newWatched = append(newWatched, s)
-				}
-			}
-
-			if !isWatched {
-				newWatched = append(newWatched, epSort)
-			}
-			list[i].WatchedEps = newWatched
-			break
+	return a.updateLibraryItem(subjectID, func(item *FollowedItem) error {
+		if slices.Contains(item.WatchedEps, epSort) {
+			item.WatchedEps = slices.DeleteFunc(item.WatchedEps, func(v float64) bool { return v == epSort })
+		} else {
+			item.WatchedEps = append(item.WatchedEps, epSort)
 		}
-	}
-
-	if !found {
-		return "Not followed"
-	}
-
-	return a.saveFollowedList(list)
+		if item.WatchOverrides == nil {
+			item.WatchOverrides = map[string]bool{}
+		}
+		item.WatchOverrides[fmt.Sprint(epSort)] = slices.Contains(item.WatchedEps, epSort)
+		return nil
+	})
 }
 
 // SearchEpisodeMagnet 搜索集数磁力链接
@@ -604,14 +597,15 @@ func (a *App) SearchEpisodeMagnet(subjectID int, epSort float64) string {
 	a.Log("INFO", fmt.Sprintf("搜索磁力: ID=%d, Ep=%v", subjectID, epSort))
 
 	// 1. 获取追番信息
-	list := a.GetLocalFollows()
+	list, loadErr := a.readLibrary()
+	if loadErr != nil {
+		return "Error: " + loadErr.Error()
+	}
 	var targetItem *FollowedItem
-	var targetIndex int
 
 	for i, v := range list {
 		if v.SubjectID == subjectID {
 			targetItem = &list[i]
-			targetIndex = i
 			break
 		}
 	}
@@ -641,16 +635,8 @@ func (a *App) SearchEpisodeMagnet(subjectID int, epSort float64) string {
 	}
 	a.Log("INFO", fmt.Sprintf("自动优选资源: %s (来源: %s)", res.Title, res.Source))
 
-	// 5. 保存结果
-	if targetItem.EpisodeMagnets == nil {
-		targetItem.EpisodeMagnets = make(map[string]string)
-	}
-	targetItem.EpisodeMagnets[epKey] = res.Magnet
-
-	// 更新列表
-	list[targetIndex] = *targetItem
-	if res := a.saveFollowedList(list); res != "Success" {
-		a.Log("ERROR", "保存磁力链接失败: "+res)
+	if saved := a.SaveEpisodeMagnet(subjectID, epSort, res.Magnet); saved != "Success" {
+		return saved
 	}
 
 	return res.Magnet
@@ -670,91 +656,18 @@ func (a *App) SearchEpisodeMagnetList(subjectID int, epSort float64, customKeywo
 	return a.crawler.SearchEpisodeList(keywords, epSort)
 }
 
-// SaveEpisodeMagnet 手动保存选定的磁力链接
 func (a *App) SaveEpisodeMagnet(subjectID int, epSort float64, magnet string) string {
-	a.Log("INFO", fmt.Sprintf("保存磁力: ID=%d, Ep=%v", subjectID, epSort))
-
-	list := a.GetLocalFollows()
-	var targetItem *FollowedItem
-	var targetIndex int
-
-	for i, v := range list {
-		if v.SubjectID == subjectID {
-			targetItem = &list[i]
-			targetIndex = i
-			break
+	return a.updateLibraryItem(subjectID, func(item *FollowedItem) error {
+		if item.EpisodeMagnets == nil {
+			item.EpisodeMagnets = map[string]string{}
 		}
-	}
-
-	if targetItem == nil {
-		return "Error: 请先追番"
-	}
-
-	// 保存磁力链接
-	epKey := fmt.Sprintf("%v", epSort)
-	if targetItem.EpisodeMagnets == nil {
-		targetItem.EpisodeMagnets = make(map[string]string)
-	}
-	targetItem.EpisodeMagnets[epKey] = magnet
-
-	// 更新列表
-	list[targetIndex] = *targetItem
-	return a.saveFollowedList(list)
+		item.EpisodeMagnets[fmt.Sprint(epSort)] = magnet
+		return nil
+	})
 }
 
-// UnfollowLocal 取消本地追番
 func (a *App) UnfollowLocal(subjectID int) string {
-	a.Log("INFO", fmt.Sprintf("取消本地追番: %d", subjectID))
-
-	list := a.GetLocalFollows()
-	newList := []FollowedItem{}
-	found := false
-
-	for _, v := range list {
-		if v.SubjectID == subjectID {
-			found = true
-			continue
-		}
-		newList = append(newList, v)
-	}
-
-	if !found {
-		return "Not found"
-	}
-
-	return a.saveFollowedList(newList)
-}
-
-// GetLocalFollows 获取本地追番列表
-func (a *App) GetLocalFollows() []FollowedItem {
-	// 简单实现：每次都读文件
-	cwd, _ := os.Getwd()
-	path := filepath.Join(cwd, "followed.json")
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return []FollowedItem{}
-	}
-
-	var list []FollowedItem
-	_ = json.Unmarshal(data, &list)
-	return list
-}
-
-// saveFollowedList 保存追番列表到文件
-func (a *App) saveFollowedList(list []FollowedItem) string {
-	cwd, _ := os.Getwd()
-	path := filepath.Join(cwd, "followed.json")
-
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
-	}
-
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Sprintf("Error: %v", err)
-	}
-	return "Success"
+	return a.updateLibraryItem(subjectID, func(item *FollowedItem) error { item.Archived = true; return nil })
 }
 
 // AnimeDetail 聚合的动漫详情
@@ -837,10 +750,13 @@ func (a *App) GetAnimeDetail(subjectID int) (*AnimeDetail, error) {
 	watchedEps := []float64{}
 	downloadedEps := []float64{}
 	episodeMagnets := make(map[string]string)
-	localFollows := a.GetLocalFollows()
+	localFollows, loadErr := a.readLibrary()
+	if loadErr != nil {
+		return nil, loadErr
+	}
 	for _, f := range localFollows {
 		if f.SubjectID == subjectID {
-			isFollowed = true
+			isFollowed = !f.Archived
 			watchedEps = f.WatchedEps
 			downloadedEps = f.DownloadedEps
 			episodeMagnets = f.EpisodeMagnets
@@ -879,10 +795,23 @@ func (a *App) nextPikPakClient() (*pikpak.PikPakClient, error) {
 
 // addOfflineTaskWithRecovery 空间不足时先清空并重试，确认次数耗尽后才切换账号。
 func (a *App) addOfflineTaskWithRecovery(client *pikpak.PikPakClient, magnet string, accountCount int, switchAccount func() (*pikpak.PikPakClient, error)) (*pikpak.OfflineTask, *pikpak.PikPakClient, error) {
+	return a.addOfflineTaskWithContext(a.taskContext(), client, magnet, accountCount, switchAccount)
+}
+
+func (a *App) addOfflineTaskWithContext(ctx context.Context, client *pikpak.PikPakClient, magnet string, accountCount int, switchAccount func() (*pikpak.PikPakClient, error)) (*pikpak.OfflineTask, *pikpak.PikPakClient, error) {
 	a.taskMu.Lock()
 	defer a.taskMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if current := a.currentPikPakClient(); current != nil {
 		client = current
+	}
+	if client != nil && a.isAccountBlocked(client.Username) {
+		if err := a.loginForDownload(); err != nil {
+			return nil, nil, err
+		}
+		client = a.currentPikPakClient()
 	}
 	if client == nil {
 		return nil, nil, fmt.Errorf("PikPak 尚未登录")
@@ -893,10 +822,16 @@ func (a *App) addOfflineTaskWithRecovery(client *pikpak.PikPakClient, magnet str
 	for accountAttempt := 0; accountAttempt < accountCount; accountAttempt++ {
 		cleared := false
 		for {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
 			a.Log("INFO", fmt.Sprintf("正在通过账号 %s 添加离线任务", client.Username))
 			task, err := client.OfflineDownload(magnet, "", "")
 			if err == nil {
 				return task, client, nil
+			}
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				return nil, nil, cancelErr
 			}
 			if isPikPakStorageError(err) {
 				if cleared {
@@ -915,6 +850,9 @@ func (a *App) addOfflineTaskWithRecovery(client *pikpak.PikPakClient, magnet str
 			}
 			if !cleared {
 				full, quotaErr := client.IsStorageFull()
+				if cancelErr := ctx.Err(); cancelErr != nil {
+					return nil, nil, cancelErr
+				}
 				if quotaErr != nil {
 					a.Log("WARN", fmt.Sprintf("查询账号 %s 的云盘容量失败: %v", client.Username, quotaErr))
 				} else if full {
@@ -925,6 +863,9 @@ func (a *App) addOfflineTaskWithRecovery(client *pikpak.PikPakClient, magnet str
 					cleared = true
 					a.Log("SUCCESS", fmt.Sprintf("账号 %s 云盘已清空", client.Username))
 				}
+			}
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				return nil, nil, cancelErr
 			}
 			a.markAccountBlocked(client.Username, "每日配额已满")
 			if accountAttempt == accountCount-1 || switchAccount == nil {
@@ -947,58 +888,23 @@ func (a *App) addOfflineTaskWithRecovery(client *pikpak.PikPakClient, magnet str
 
 // getPikPakFileFromMagnet 从磁力链接获取 PikPak 文件信息 (自动处理文件夹)
 func (a *App) getPikPakFileFromMagnet(magnet string) (string, string, int64, *pikpak.PikPakClient, error) {
-	if a.currentPikPakClient() == nil {
-		if err := a.loginForDownload(); err != nil {
-			return "", "", 0, nil, fmt.Errorf("PikPak 登录失败: %w", err)
-		}
+	if err := a.loginForDownload(); err != nil {
+		return "", "", 0, nil, err
 	}
 	task, client, err := a.addOfflineTaskWithRecovery(a.currentPikPakClient(), magnet, len(a.configMgr.Snapshot().GlobalSettings.PikPakUsers), a.nextPikPakClient)
 	if err != nil {
 		return "", "", 0, nil, err
 	}
-
-	a.Log("INFO", fmt.Sprintf("任务添加成功，TaskID: %s, FileID: %s, Phase: %s", task.ID, task.FileID, task.Phase))
-
-	fileID := task.FileID
-	finalTaskName := task.FileName
-	if finalTaskName == "" {
-		finalTaskName = task.Name
+	ctx, cancel := context.WithTimeout(a.taskContext(), 10*time.Minute)
+	defer cancel()
+	completed, err := a.waitOfflineTask(ctx, client, *task)
+	if err != nil {
+		return "", "", 0, nil, err
 	}
+	return a.resolvePikPakFile(client, completed.FileID, completed.FileName, 0)
+}
 
-	// 即使有 FileID，如果状态不是 COMPLETE，也需要等待
-	if fileID == "" || task.Phase != "PHASE_TYPE_COMPLETE" {
-		a.Log("INFO", "任务正在进行中，等待离线下载完成...")
-		// 轮询任务状态
-		for i := 0; i < 60; i++ { // 最多等待 60秒
-			time.Sleep(1 * time.Second)
-			// includeDone=true 以便能查到已完成的任务
-			tasks, err := client.OfflineList(true)
-			if err != nil {
-				a.Log("WARN", fmt.Sprintf("轮询任务列表失败: %v", err))
-				continue
-			}
-			for _, t := range tasks {
-				if t.ID == task.ID {
-					if t.Phase == "PHASE_TYPE_COMPLETE" {
-						fileID = t.FileID
-						if t.FileName != "" {
-							finalTaskName = t.FileName
-						} else {
-							finalTaskName = t.Name
-						}
-						a.Log("INFO", fmt.Sprintf("任务已完成，FileID: %s", fileID))
-						goto Found
-					} else if t.Phase == "PHASE_TYPE_ERROR" {
-						return "", "", 0, nil, fmt.Errorf("离线下载失败 %s", t.Message)
-					}
-					// 仍在运行中...
-				}
-			}
-		}
-		return "", "", 0, nil, fmt.Errorf("离线下载超时或未完成")
-	}
-
-Found:
+func (a *App) resolvePikPakFile(client *pikpak.PikPakClient, fileID, finalTaskName string, episode float64) (string, string, int64, *pikpak.PikPakClient, error) {
 	a.Log("INFO", fmt.Sprintf("离线完成，初始ID: %s", fileID))
 
 	// 检查是否为文件夹
@@ -1039,7 +945,25 @@ Found:
 		}
 
 		var largestFile *pikpak.File
+		videos := []pikpak.File{}
 		for _, f := range files {
+			if f.Kind == "drive#file" && strings.HasPrefix(f.MimeType, "video/") {
+				videos = append(videos, f)
+			}
+		}
+		if len(videos) > 1 {
+			matching := []pikpak.File{}
+			for _, f := range videos {
+				if episode > 0 && crawler.ParseEpisodeNumber(f.Name) == episode {
+					matching = append(matching, f)
+				}
+			}
+			if len(matching) != 1 {
+				return "", "", 0, nil, fmt.Errorf("目录包含多个视频，无法唯一确认第 %g 集，请选择单集资源", episode)
+			}
+			videos = matching
+		}
+		for _, f := range videos {
 			if f.Kind == "drive#file" && strings.HasPrefix(f.MimeType, "video/") {
 				if largestFile == nil {
 					fCopy := f
@@ -1072,183 +996,38 @@ Found:
 	return "", "", 0, nil, fmt.Errorf("无法获取文件信息")
 }
 
-// DownloadEpisode 下载单集
-func (a *App) DownloadEpisode(subjectID int, epSort float64, magnet string) string {
-	if subjectID <= 0 || epSort <= 0 || !strings.HasPrefix(strings.ToLower(magnet), "magnet:?xt=urn:btih:") {
-		return "Error: 无效的番剧、集数或磁力链接"
+func (a *App) markEpisodeDownloaded(subjectID int, epSort float64, filePath string) error {
+	result := a.updateLibraryItem(subjectID, func(item *FollowedItem) error {
+		if !slices.Contains(item.DownloadedEps, epSort) {
+			item.DownloadedEps = append(item.DownloadedEps, epSort)
+		}
+		if item.LocalFiles == nil {
+			item.LocalFiles = map[string]string{}
+		}
+		item.LocalFiles[fmt.Sprint(epSort)] = filePath
+		return nil
+	})
+	if result != "Success" {
+		return fmt.Errorf("%s", result)
 	}
-	if a.configMgr == nil {
-		return "Error: PikPak 配置未初始化"
-	}
-	settings := a.configMgr.Snapshot().GlobalSettings
-	if a.currentPikPakClient() == nil && (len(settings.PikPakUsers) == 0 || settings.PikPakPassword == "") {
-		return "Error: 请先在桌面设置中配置 PikPak 账号和密码"
-	}
-	a.Log("INFO", fmt.Sprintf("开始下载任务: ID=%d, Ep=%v", subjectID, epSort))
-
-	go func() {
-		reportError := func(err error) {
-			a.Log("ERROR", fmt.Sprintf("下载失败: %v", err))
-			data := map[string]interface{}{"subject_id": subjectID, "ep_sort": epSort, "error": err.Error()}
-			if a.ctx != nil {
-				runtime.EventsEmit(a.ctx, "download-error", data)
-			}
-			a.webEvents.publish("download-error", data)
-		}
-		// 1. 获取文件信息
-		fileID, fileName, fileSize, client, err := a.getPikPakFileFromMagnet(magnet)
-		if err != nil {
-			reportError(err)
-			return
-		}
-
-		// 2. 确定保存路径
-		// 获取番剧名称
-		animeName := fmt.Sprintf("Anime_%d", subjectID)
-		localFollows := a.GetLocalFollows()
-		for _, f := range localFollows {
-			if f.SubjectID == subjectID {
-				animeName = f.Name
-				break
-			}
-		}
-		animeName = sanitizePathSegment(animeName)
-
-		cwd, _ := os.Getwd()
-		downloadDir := filepath.Join(cwd, "Downloads", animeName)
-		if err := os.MkdirAll(downloadDir, 0755); err != nil {
-			reportError(err)
-			return
-		}
-
-		safeFileName := sanitizePathSegment(fileName)
-		savePath := filepath.Join(downloadDir, safeFileName)
-		a.Log("INFO", fmt.Sprintf("开始下载到: %s", savePath))
-
-		// Fetch comments while the video downloads. Failure is logged separately;
-		// it must never turn a successful video transfer into a failed download.
-		danmakuDone := make(chan struct{})
-		danmakuParent := a.ctx
-		if danmakuParent == nil {
-			danmakuParent = context.Background()
-		}
-		danmakuCtx, cancelDanmaku := context.WithCancel(danmakuParent)
-		defer cancelDanmaku()
-		go func() {
-			defer close(danmakuDone)
-			a.prepareEpisodeDanmaku(danmakuCtx, subjectID, epSort, savePath)
-		}()
-
-		// 3. 开始下载
-		var lastTime = time.Now()
-		var lastBytes int64 = 0
-		var speed int64 = 0
-		lastProgressLogTime := time.Now().Add(-10 * time.Second)
-
-		err = client.DownloadFileConcurrent(fileID, savePath, fileSize, 16, func(current, total int64) {
-			now := time.Now()
-			duration := now.Sub(lastTime)
-
-			// 每秒更新一次速度和进度
-			if duration >= time.Second {
-				bytesDiff := current - lastBytes
-				speed = int64(float64(bytesDiff) / duration.Seconds())
-
-				lastTime = now
-				lastBytes = current
-
-				progressVal := float64(current) / float64(total) * 100
-
-				// 打印进度到控制台
-				fmt.Printf("\r⬇️ [下载中] 进度: %.2f%% | 速度: %s/s | 已下载: %s | 总大小: %s   ",
-					progressVal, formatBytes(speed), formatBytes(current), formatBytes(total))
-
-				// 打包版通常看不到控制台输出，这里节流写入应用日志。
-				if now.Sub(lastProgressLogTime) >= 5*time.Second || current == total {
-					a.Log("INFO", fmt.Sprintf("下载进度: %.2f%% | 速度: %s/s | 已下载: %s/%s",
-						progressVal, formatBytes(speed), formatBytes(current), formatBytes(total)))
-					lastProgressLogTime = now
-				}
-
-				if a.ctx != nil {
-					runtime.EventsEmit(a.ctx, "download-progress", map[string]interface{}{
-						"subject_id": subjectID,
-						"ep_sort":    epSort,
-						"progress":   progressVal,
-						"speed":      speed, // bytes per second
-						"total":      total,
-						"current":    current,
-					})
-				}
-			}
-		})
-		fmt.Println() // 换行
-
-		if err != nil {
-			reportError(err)
-			return
-		}
-
-		a.Log("INFO", fmt.Sprintf("下载完成: %s", fileName))
-		<-danmakuDone
-
-		// 4. 标记为已下载
-		a.markEpisodeDownloaded(subjectID, epSort, savePath)
-
-		if a.ctx != nil {
-			runtime.EventsEmit(a.ctx, "download-complete", map[string]interface{}{
-				"subject_id": subjectID,
-				"ep_sort":    epSort,
-				"path":       savePath,
-			})
-		}
-		a.webEvents.publish("download-complete", map[string]interface{}{
-			"subject_id": subjectID,
-			"ep_sort":    epSort,
-			"path":       savePath,
-		})
-	}()
-
-	return "Started"
-}
-
-// markEpisodeDownloaded 标记集数已下载
-func (a *App) markEpisodeDownloaded(subjectID int, epSort float64, filePath string) {
-	list := a.GetLocalFollows()
-
-	for i, v := range list {
-		if v.SubjectID == subjectID {
-			// 检查是否已存在
-			exists := false
-			for _, s := range v.DownloadedEps {
-				if s == epSort {
-					exists = true
-					break
-				}
-			}
-			if !exists {
-				list[i].DownloadedEps = append(list[i].DownloadedEps, epSort)
-			}
-
-			// 更新文件路径
-			if list[i].LocalFiles == nil {
-				list[i].LocalFiles = make(map[string]string)
-			}
-			epKey := fmt.Sprintf("%v", epSort)
-			list[i].LocalFiles[epKey] = filePath
-
-			a.saveFollowedList(list)
-			break
-		}
-	}
+	return nil
 }
 
 // PlayLocalEpisode 播放本地已下载的剧集
 func (a *App) PlayLocalEpisode(subjectID int, epSort float64) string {
+	return a.playLocalEpisode(subjectID, epSort, false)
+}
+func (a *App) RestartLocalEpisode(subjectID int, epSort float64) string {
+	return a.playLocalEpisode(subjectID, epSort, true)
+}
+func (a *App) playLocalEpisode(subjectID int, epSort float64, restart bool) string {
 	a.Log("INFO", fmt.Sprintf("请求播放本地文件: ID=%d, Ep=%v", subjectID, epSort))
 
 	// 1. 查找文件路径
-	list := a.GetLocalFollows()
+	list, loadErr := a.readLibrary()
+	if loadErr != nil {
+		return "Error: " + loadErr.Error()
+	}
 	var filePath string
 	found := false
 
@@ -1269,54 +1048,24 @@ func (a *App) PlayLocalEpisode(subjectID int, epSort float64) string {
 		return "Error: 未找到本地文件记录"
 	}
 
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Join(a.dataDir(), filePath)
+	}
 	// 2. 检查文件是否存在
 	if _, err := os.Stat(filePath); err != nil {
-		a.Log("WARN", fmt.Sprintf("文件不存在，自动清理记录: %s", filePath))
-		a.removeEpisodeRecord(subjectID, epSort)
+		if !os.IsNotExist(err) {
+			return fmt.Sprintf("Error: 无法访问本地文件（记录已保留）: %v", err)
+		}
+		if _, dirErr := os.Stat(filepath.Dir(filePath)); dirErr != nil {
+			return fmt.Sprintf("Error: 本地目录暂不可访问（记录已保留）: %v", dirErr)
+		}
+		if result := a.removeEpisodeRecord(subjectID, epSort, filePath); result != "Success" {
+			return result
+		}
 		return "Error: FileMissing"
 	}
 
-	// 3. 启动 MPV
-	a.Log("INFO", fmt.Sprintf("启动 MPV 播放本地文件: %s", filePath))
-
-	// 优先使用配置中的 MPV 路径
-	playerSettings := a.configMgr.Snapshot().Player
-	mpvPath := playerSettings.MPVPath
-	if mpvPath == "" {
-		mpvPath = "mpv" // 默认尝试环境变量
-		if _, err := os.Stat("mpv.exe"); err == nil {
-			mpvPath = ".\\mpv.exe"
-		} else if _, err := os.Stat("bin/mpv.exe"); err == nil {
-			mpvPath = "bin\\mpv.exe"
-		}
-	}
-
-	// 构造参数
-	args := []string{filePath, "--force-window"}
-	if playerSettings.MPVArgs != "" {
-		// 简单分割参数，不支持带空格的引号参数，后续可优化
-		userArgs := strings.Fields(playerSettings.MPVArgs)
-		args = append(args, userArgs...)
-	}
-	args = append(args, a.localDanmakuArgs(filePath)...)
-
-	// 构造命令
-	cmd := exec.Command(mpvPath, args...)
-
-	// 设置工作目录
-	cwd, _ := os.Getwd()
-	cmd.Dir = cwd
-
-	// 绑定输出以便调试
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		a.Log("ERROR", fmt.Sprintf("启动 MPV 失败: %v", err))
-		return fmt.Sprintf("Error: 启动 MPV 失败 %v", err)
-	}
-
-	return "Success"
+	return a.launchLocalPlayer(subjectID, epSort, filePath, restart)
 }
 
 // PlayMagnet 添加磁力并调用 MPV 播放
@@ -1339,15 +1088,7 @@ func (a *App) PlayMagnet(magnet string) string {
 
 	// 优先使用配置中的 MPV 路径
 	playerSettings := a.configMgr.Snapshot().Player
-	mpvPath := playerSettings.MPVPath
-	if mpvPath == "" {
-		mpvPath = "mpv" // 默认尝试环境变量
-		if _, err := os.Stat("mpv.exe"); err == nil {
-			mpvPath = ".\\mpv.exe"
-		} else if _, err := os.Stat("bin/mpv.exe"); err == nil {
-			mpvPath = "bin\\mpv.exe"
-		}
-	}
+	mpvPath := a.playerExecutable(playerSettings.MPVPath)
 
 	// 构造参数
 	// 使用 --force-window 确保窗口显示
@@ -1355,15 +1096,17 @@ func (a *App) PlayMagnet(magnet string) string {
 	args := []string{playUrl, "--force-window", "--http-header-fields=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
 
 	if playerSettings.MPVArgs != "" {
-		userArgs := strings.Fields(playerSettings.MPVArgs)
+		userArgs, err := parsePlayerArgs(playerSettings.MPVArgs)
+		if err != nil {
+			return "Error: " + err.Error()
+		}
 		args = append(args, userArgs...)
 	}
 
 	cmd := exec.Command(mpvPath, args...)
 
 	// 设置工作目录，确保能读取到 input.conf
-	cwd, _ := os.Getwd()
-	cmd.Dir = cwd
+	cmd.Dir = a.dataDir()
 
 	// 绑定输出以便调试
 	cmd.Stdout = os.Stdout
@@ -1374,42 +1117,64 @@ func (a *App) PlayMagnet(magnet string) string {
 		return fmt.Sprintf("Error: 启动 MPV 失败 %v", err)
 	}
 
+	go cmd.Wait()
 	return "Success"
 }
 
 // GetBlockedAccounts 获取当前被封禁的账号列表
 func (a *App) GetBlockedAccounts() map[string]string {
+	result := map[string]string{}
 	a.stateMu.RLock()
-	defer a.stateMu.RUnlock()
-	result := make(map[string]string, len(a.blockedAccounts))
 	for user, date := range a.blockedAccounts {
-		result[user] = date
+		if date == time.Now().Format("2006-01-02") {
+			result[user] = "今日额度/登录受限"
+		}
+	}
+	a.stateMu.RUnlock()
+	if a.configMgr != nil {
+		settings := a.configMgr.Snapshot().GlobalSettings
+		for user, reset := range settings.QuotaBlockedUntil {
+			if until, err := time.Parse(time.RFC3339, reset); err == nil && time.Now().Before(until) {
+				result[user] = "今日额度/登录受限"
+			}
+		}
+		for user, disabled := range settings.DisabledAccounts {
+			if disabled {
+				result[user] = "已停用"
+			}
+		}
 	}
 	return result
 }
 
 // SetAccountBlockStatus 手动设置账号封禁状态
 func (a *App) SetAccountBlockStatus(username string, blocked bool) string {
-	a.stateMu.Lock()
-	if a.blockedAccounts == nil {
-		a.blockedAccounts = make(map[string]string)
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return "Error: 账号不能为空"
 	}
-
-	if blocked {
-		// 封禁：设置为今天
-		today := time.Now().Format("2006-01-02")
-		a.blockedAccounts[username] = today
-	} else {
-		// 解封：删除记录
-		delete(a.blockedAccounts, username)
+	a.taskMu.Lock()
+	defer a.taskMu.Unlock()
+	if a.configMgr == nil {
+		return "Error: 配置未初始化"
 	}
-	a.stateMu.Unlock()
-	a.Log("INFO", fmt.Sprintf("账号 %s 封禁状态设为 %v", username, blocked))
+	if err := a.configMgr.SetAccountState(username, &blocked, ""); err != nil {
+		return "Error: " + err.Error()
+	}
 	return "Success"
 }
 
 // isAccountBlocked 检查账号是否今日不可用
 func (a *App) isAccountBlocked(username string) bool {
+	if a.configMgr != nil {
+		settings := a.configMgr.Snapshot().GlobalSettings
+		if settings.DisabledAccounts[username] {
+			return true
+		}
+		if until, err := time.Parse(time.RFC3339, settings.QuotaBlockedUntil[username]); err == nil && time.Now().Before(until) {
+			return true
+		}
+	}
 	a.stateMu.RLock()
 	defer a.stateMu.RUnlock()
 	if a.blockedAccounts == nil {
@@ -1433,6 +1198,13 @@ func (a *App) markAccountBlocked(username string, reason string) {
 	today := time.Now().Format("2006-01-02")
 	a.blockedAccounts[username] = today
 	a.stateMu.Unlock()
+	if a.configMgr != nil {
+		now := time.Now()
+		reset := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location()).UTC().Format(time.RFC3339)
+		if err := a.configMgr.SetAccountState(username, nil, reset); err != nil {
+			a.Log("ERROR", "保存账号额度状态失败: "+err.Error())
+		}
+	}
 	a.Log("WARN", fmt.Sprintf("账号 %s 已被标记为今日不可用 (原因: %s)", username, reason))
 }
 
@@ -1444,7 +1216,7 @@ func (a *App) loginForDownload() error {
 }
 
 func (a *App) loginForDownloadLocked(next bool) error {
-	if !next && a.currentPikPakClient() != nil {
+	if current := a.currentPikPakClient(); !next && current != nil && !a.isAccountBlocked(current.Username) {
 		return nil
 	}
 	settings := a.configMgr.Snapshot().GlobalSettings
@@ -1527,99 +1299,63 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// removeEpisodeRecord 移除集数下载记录
-func (a *App) removeEpisodeRecord(subjectID int, epSort float64) {
-	list := a.GetLocalFollows()
-	for i, v := range list {
-		if v.SubjectID == subjectID {
-			// 移除 DownloadedEps
-			newEps := []float64{}
-			for _, e := range v.DownloadedEps {
-				if e != epSort {
-					newEps = append(newEps, e)
-				}
-			}
-			list[i].DownloadedEps = newEps
-
-			// 移除 LocalFiles
-			epKey := fmt.Sprintf("%v", epSort)
-			if list[i].LocalFiles != nil {
-				delete(list[i].LocalFiles, epKey)
-			}
-			a.saveFollowedList(list)
-			break
-		}
-	}
+func clearDownloadRecord(item *FollowedItem, epSort float64) {
+	item.DownloadedEps = slices.DeleteFunc(item.DownloadedEps, func(v float64) bool { return v == epSort })
+	delete(item.LocalFiles, fmt.Sprint(epSort))
 }
 
-// DeleteEpisodeData 删除集数的磁力链接和/或本地文件
+func (a *App) removeEpisodeRecord(subjectID int, epSort float64, expectedPath string) string {
+	return a.updateLibraryItem(subjectID, func(item *FollowedItem) error {
+		current := item.LocalFiles[fmt.Sprint(epSort)]
+		if !filepath.IsAbs(current) {
+			current = filepath.Join(a.dataDir(), current)
+		}
+		if current != expectedPath {
+			return fmt.Errorf("文件记录已更新，请重试播放")
+		}
+		if _, err := os.Stat(current); err == nil {
+			return fmt.Errorf("文件已恢复，请重试播放")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if _, err := os.Stat(filepath.Dir(current)); err != nil {
+			return fmt.Errorf("本地目录暂不可访问，记录已保留: %w", err)
+		}
+		clearDownloadRecord(item, epSort)
+		return nil
+	})
+}
+
+// DeleteEpisodeData keeps both indexes when removing the video fails.
 func (a *App) DeleteEpisodeData(subjectID int, epSort float64) string {
-	a.Log("INFO", fmt.Sprintf("删除集数数据: ID=%d, Ep=%v", subjectID, epSort))
-
-	list := a.GetLocalFollows()
-	var targetItem *FollowedItem
-	var targetIndex int
-
-	for i, v := range list {
-		if v.SubjectID == subjectID {
-			targetItem = &list[i]
-			targetIndex = i
-			break
-		}
+	a.downloadMu.Lock()
+	defer a.downloadMu.Unlock()
+	if task, ok := a.downloads[downloadKey(subjectID, epSort)]; ok && activeDownload(task.State) {
+		return "Error: 此集正在下载，请等待任务结束后删除"
 	}
-
-	if targetItem == nil {
-		return "Error: 未找到追番记录"
+	if cancel := a.downloadDanmaku[downloadKey(subjectID, epSort)]; cancel != nil {
+		cancel()
+		delete(a.downloadDanmaku, downloadKey(subjectID, epSort))
 	}
-
-	epKey := fmt.Sprintf("%v", epSort)
-	deleted := false
-
-	// 1. 删除本地文件
-	if targetItem.LocalFiles != nil {
-		if filePath, ok := targetItem.LocalFiles[epKey]; ok && filePath != "" {
-			if err := os.Remove(filePath); err != nil {
-				a.Log("WARN", fmt.Sprintf("删除本地文件失败: %v", err))
-			} else {
-				a.Log("INFO", fmt.Sprintf("✅ 已删除本地文件: %s", filePath))
-				if err := os.Remove(danmakuPath(filePath)); err != nil && !os.IsNotExist(err) {
-					a.Log("WARN", fmt.Sprintf("删除弹幕文件失败: %v", err))
-				}
-				deleted = true
+	return a.updateLibraryItem(subjectID, func(item *FollowedItem) error {
+		key := fmt.Sprint(epSort)
+		a.danmakuMu.Lock()
+		defer a.danmakuMu.Unlock()
+		if path := item.LocalFiles[key]; path != "" {
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(a.dataDir(), path)
 			}
-			delete(targetItem.LocalFiles, epKey)
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("删除视频失败，记录已保留: %w", err)
+			}
+			if err := os.Remove(danmakuPath(path)); err != nil && !os.IsNotExist(err) {
+				a.Log("WARN", fmt.Sprintf("删除弹幕文件失败: %v", err))
+			}
 		}
-	}
-
-	// 2. 删除磁力链接记录
-	if targetItem.EpisodeMagnets != nil {
-		if _, ok := targetItem.EpisodeMagnets[epKey]; ok {
-			delete(targetItem.EpisodeMagnets, epKey)
-			a.Log("INFO", "✅ 已删除磁力链接记录")
-			deleted = true
-		}
-	}
-
-	// 3. 移除下载标记
-	newDownloadedEps := []float64{}
-	for _, e := range targetItem.DownloadedEps {
-		if e != epSort {
-			newDownloadedEps = append(newDownloadedEps, e)
-		}
-	}
-	targetItem.DownloadedEps = newDownloadedEps
-
-	// 保存更新
-	list[targetIndex] = *targetItem
-	if res := a.saveFollowedList(list); res != "Success" {
-		return res
-	}
-
-	if !deleted {
-		return "Error: 未找到可删除的数据"
-	}
-
-	return "Success"
+		clearDownloadRecord(item, epSort)
+		delete(item.EpisodeMagnets, key)
+		return nil
+	})
 }
 
 // ClearPikPakStorage 手动清空指定 PikPak 账号的云盘空间

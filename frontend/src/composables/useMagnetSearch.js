@@ -1,5 +1,5 @@
 import { ref, onUnmounted } from 'vue';
-import { StreamEpisodeMagnets } from '../api';
+import { StreamEpisodeMagnets } from '../api.js';
 
 export function useMagnetSearch() {
   const searching = ref(false);

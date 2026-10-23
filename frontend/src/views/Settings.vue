@@ -1,6 +1,7 @@
 <template>
   <div class="p-6 text-white">
     <h1 class="text-2xl font-bold mb-6">⚙️ 系统设置</h1>
+    <p v-if="loadError" role="alert" class="mb-4 text-red-300">{{ loadError }} <button @click="loadConfig" class="underline">重试</button></p>
     
     <div class="space-y-6 max-w-2xl">
       <!-- PikPak 设置 -->
@@ -20,9 +21,9 @@
                 @click="toggleBlockStatus(user)" 
                 class="px-3 py-2.5 rounded transition text-sm font-bold whitespace-nowrap"
                 :class="isBlocked(user) ? 'bg-red-600 text-white hover:bg-red-700' : 'bg-green-900/30 text-green-400 hover:bg-green-900/50'"
-                :title="isBlocked(user) ? '点击解封 (已封禁: ' + getBlockDate(user) + ')' : '点击手动封禁'"
+                :title="blockedAccounts[user] === '已停用' ? '点击启用；额度状态仍单独保留' : '点击停用，已有传输可继续'"
               >
-                {{ isBlocked(user) ? '🚫 已封禁' : '✅ 正常' }}
+                {{ blockedAccounts[user] || '可用' }}
               </button>
 
               <!-- 清空云盘按钮 -->
@@ -61,7 +62,7 @@
         <label class="flex items-center justify-between gap-4 cursor-pointer">
           <span>
             <span class="block font-medium">自动优选并下载</span>
-            <span class="block text-sm text-gray-400 mt-1">开启后点击未下载的剧集，会按字幕和画质排序选择首条资源并开始下载；关闭时显示候选列表供你手选。</span>
+            <span class="block text-sm text-gray-400 mt-1">开启后先核对作品、季度与集数，再按字幕和画质优选；无法确认时转为手选。</span>
           </span>
           <input v-model="config.torrent_searcher.auto_select_magnet" type="checkbox" class="w-5 h-5 accent-pink-500 flex-shrink-0">
         </label>
@@ -106,7 +107,12 @@
            <div>
             <label class="block text-sm text-gray-400 mb-1">启动参数 <span class="text-xs text-gray-500">(可选)</span></label>
             <input v-model="config.player.mpv_args" type="text" class="w-full bg-gray-900 border border-gray-700 rounded p-2.5 text-white focus:border-pink-500 focus:outline-none transition-colors" placeholder="例如: --fullscreen --volume=50">
+            <p class="mt-2 text-xs text-gray-400">本地播放自动保存进度，下次从上次位置继续。IPC、起播位置与初始暂停参数由应用管理。</p>
           </div>
+          <label class="flex items-start gap-3">
+            <input v-model="config.player.auto_next" type="checkbox" class="mt-1 accent-pink-500">
+            <span>自动播放下一集<span class="mt-1 block text-sm text-gray-400">正常看完后，倒计时 8 秒播放已下载的下一整数集，可随时取消。默认关闭。</span></span>
+          </label>
         </div>
       </div>
 
@@ -117,11 +123,13 @@
         </h2>
         <div class="space-y-4">
            <div>
+            <p class="text-xs text-gray-400">保存后统一用于后续 Bangumi、资源搜索、PikPak 和弹幕请求；正在运行的任务继续使用原连接。</p>
             <label class="block text-sm text-gray-400 mb-1">HTTP 代理 <span class="text-xs text-gray-500">(例如 http://127.0.0.1:7890)</span></label>
             <input v-model="config.global_settings.proxy" type="text" class="w-full bg-gray-900 border border-gray-700 rounded p-2.5 text-white focus:border-pink-500 focus:outline-none transition-colors" placeholder="留空则不使用代理">
           </div>
            <div>
             <label class="block text-sm text-gray-400 mb-1">下载目录</label>
+            <p class="mb-2 text-xs text-gray-400">留空使用 Downloads；相对路径基于应用数据目录。仅影响新任务，已有文件不会迁移。</p>
             <input v-model="config.local_storage.anime_dir" type="text" class="w-full bg-gray-900 border border-gray-700 rounded p-2.5 text-white focus:border-pink-500 focus:outline-none transition-colors">
           </div>
       </div>
@@ -137,7 +145,7 @@
 
       <!-- 保存按钮 -->
       <div class="flex justify-end pt-4">
-        <button @click="saveConfig" :disabled="saving" class="bg-pink-600 hover:bg-pink-700 disabled:bg-gray-600 text-white px-6 py-3 rounded-lg font-bold shadow-lg transition-all transform hover:scale-105 flex items-center">
+        <button @click="saveConfig" :disabled="saving || !!loadError" class="bg-pink-600 hover:bg-pink-700 disabled:bg-gray-600 text-white px-6 py-3 rounded-lg font-bold shadow-lg transition-all transform hover:scale-105 flex items-center">
           <span v-if="saving" class="animate-spin mr-2">⏳</span>
           {{ saving ? '保存中...' : '💾 保存配置' }}
         </button>
@@ -152,6 +160,7 @@ import { GetAppConfig, SaveAppConfig, GetBlockedAccounts, SetAccountBlockStatus,
 import BilibiliLogin from '../components/BilibiliLogin.vue';
 
 const saving = ref(false);
+const loadError = ref('');
 const clearingAccounts = ref({});
 const config = ref({
   global_settings: { pikpak_users: [''], pikpak_password: '', proxy: '' },
@@ -164,6 +173,7 @@ const blockedAccounts = ref({});
 
 const loadConfig = async () => {
   try {
+    loadError.value = '';
     const res = await GetAppConfig();
     // 确保数组存在
     if (!res.global_settings.pikpak_users) res.global_settings.pikpak_users = [''];
@@ -175,7 +185,7 @@ const loadConfig = async () => {
     
     config.value = res;
   } catch (err) {
-    console.error("加载配置失败", err);
+    loadError.value = "加载配置失败，原文件已保留：" + err;
   }
 };
 
@@ -204,12 +214,13 @@ const getBlockDate = (user) => {
 
 const toggleBlockStatus = async (user) => {
   if (!user) return;
-  const currentStatus = isBlocked(user);
+  const currentStatus = blockedAccounts.value[user] === '已停用';
   // 如果当前是封禁状态，则解封(false)；如果是正常状态，则封禁(true)
   const newStatus = !currentStatus;
   
   try {
-    await SetAccountBlockStatus(user, newStatus);
+    const result = await SetAccountBlockStatus(user, newStatus);
+    if (result !== 'Success') { alert(result); return; }
     // 刷新列表
     await loadBlockedAccounts();
   } catch (err) {
@@ -262,7 +273,7 @@ const saveConfig = async () => {
     const jsonStr = JSON.stringify(config.value);
     const res = await SaveAppConfig(jsonStr);
     if (res === "Success") {
-      alert("配置已保存！部分设置可能需要重启生效。");
+      alert("配置已保存。Token 与代理对后续请求生效；账号与下载目录用于新任务；播放器参数用于下次播放。");
     } else {
       alert("保存失败: " + res);
     }

@@ -26,6 +26,7 @@ type downloadJob struct {
 }
 
 type PikPakClient struct {
+	authMu       sync.Mutex
 	Client       *resty.Client
 	Username     string
 	Password     string
@@ -61,6 +62,14 @@ func NewPikPakClient(username, password, proxy string) *PikPakClient {
 }
 
 func (d *PikPakClient) request(url string, method string, callback func(req *resty.Request), resp interface{}) ([]byte, error) {
+	d.authMu.Lock()
+	defer d.authMu.Unlock()
+	d.CaptchaToken = ""
+	defer func() { d.CaptchaToken = "" }()
+	return d.requestLocked(url, method, callback, resp)
+}
+
+func (d *PikPakClient) requestLocked(url string, method string, callback func(req *resty.Request), resp interface{}) ([]byte, error) {
 	authRetried, captchaRetried := false, false
 	for {
 		req := d.Client.R()
@@ -101,14 +110,14 @@ func (d *PikPakClient) request(url string, method string, callback func(req *res
 		}
 		if (apiError.ErrorCode == 4122 || apiError.ErrorCode == 4121 || apiError.ErrorCode == 16) && !authRetried {
 			authRetried = true
-			if loginErr := d.Login(); loginErr != nil {
+			if loginErr := d.loginLocked(); loginErr != nil {
 				return nil, fmt.Errorf("PikPak 重新登录失败: %w", loginErr)
 			}
 			continue
 		}
 		if apiError.ErrorCode == 9 && !captchaRetried {
 			captchaRetried = true
-			if captchaErr := d.RefreshCaptchaTokenAtLogin(GetAction(method, url)); captchaErr != nil {
+			if captchaErr := d.refreshCaptchaLocked(GetAction(method, url)); captchaErr != nil {
 				return nil, fmt.Errorf("PikPak 验证码刷新失败: %w", captchaErr)
 			}
 			continue
@@ -121,6 +130,12 @@ func (d *PikPakClient) request(url string, method string, callback func(req *res
 }
 
 func (d *PikPakClient) TriggerCaptcha(action string, meta map[string]string) error {
+	d.authMu.Lock()
+	defer d.authMu.Unlock()
+	return d.triggerCaptchaLocked(action, meta)
+}
+
+func (d *PikPakClient) triggerCaptchaLocked(action string, meta map[string]string) error {
 	param := CaptchaTokenRequest{
 		Action: action, CaptchaToken: d.CaptchaToken, ClientID: AndroidClientID, DeviceID: d.DeviceID, Meta: meta, RedirectUri: "xlaccsdk01://xbase.cloud/callback?state=harbor",
 	}
@@ -148,12 +163,24 @@ func (d *PikPakClient) TriggerCaptcha(action string, meta map[string]string) err
 }
 
 func (d *PikPakClient) RefreshCaptchaTokenAtLogin(action string) error {
+	d.authMu.Lock()
+	defer d.authMu.Unlock()
+	return d.refreshCaptchaLocked(action)
+}
+
+func (d *PikPakClient) refreshCaptchaLocked(action string) error {
 	ts, sig := GetCaptchaSign(AndroidClientID, AndroidClientVersion, AndroidPackageName, d.DeviceID)
 	metas := map[string]string{"client_version": AndroidClientVersion, "package_name": AndroidPackageName, "user_id": d.UserID, "timestamp": ts, "captcha_sign": sig}
-	return d.TriggerCaptcha(action, metas)
+	return d.triggerCaptchaLocked(action, metas)
 }
 
 func (d *PikPakClient) Login() error {
+	d.authMu.Lock()
+	defer d.authMu.Unlock()
+	return d.loginLocked()
+}
+
+func (d *PikPakClient) loginLocked() error {
 	url := "https://user.mypikpak.com/v1/auth/signin"
 	metas := map[string]string{}
 	if strings.Contains(d.Username, "@") {
@@ -163,7 +190,7 @@ func (d *PikPakClient) Login() error {
 	}
 	d.CaptchaToken = ""
 
-	if err := d.TriggerCaptcha("POST:"+url, metas); err != nil {
+	if err := d.triggerCaptchaLocked("POST:"+url, metas); err != nil {
 		return fmt.Errorf("获取 PikPak 登录验证码失败: %w", err)
 	}
 
@@ -210,7 +237,6 @@ func (d *PikPakClient) listActiveFiles(parentID string) ([]File, error) {
 func (d *PikPakClient) listFiles(parentID, filters string) ([]File, error) {
 	var allFiles []File
 	pageToken := ""
-	d.CaptchaToken = ""
 	for {
 		query := map[string]string{"parent_id": parentID, "thumbnail_size": "SIZE_LARGE", "limit": "100", "filters": filters}
 		if pageToken != "" {
@@ -263,12 +289,16 @@ func (d *PikPakClient) IsStorageFull() (bool, error) {
 }
 
 func (d *PikPakClient) GetDownloadUrl(fileID string) (string, error) {
+	d.authMu.Lock()
+	defer d.authMu.Unlock()
+	d.CaptchaToken = ""
+	defer func() { d.CaptchaToken = "" }()
 	action := fmt.Sprintf("GET:/drive/v1/files/%s", fileID)
-	if err := d.RefreshCaptchaTokenAtLogin(action); err != nil {
+	if err := d.refreshCaptchaLocked(action); err != nil {
 		return "", err
 	}
 	var resp File
-	_, err := d.request("https://api-drive.mypikpak.com/drive/v1/files/"+fileID, http.MethodGet, func(req *resty.Request) {
+	_, err := d.requestLocked("https://api-drive.mypikpak.com/drive/v1/files/"+fileID, http.MethodGet, func(req *resty.Request) {
 		req.SetQueryParams(map[string]string{"usage": "FETCH", "thumbnail_size": "SIZE_LARGE"})
 	}, &resp)
 	d.CaptchaToken = ""
@@ -279,20 +309,17 @@ func (d *PikPakClient) GetDownloadUrl(fileID string) (string, error) {
 }
 
 func (d *PikPakClient) BatchTrash(fileIDs []string) error {
-	d.CaptchaToken = ""
 	// 使用用户提供的验证过的 API 逻辑
 	_, err := d.request("https://api-drive.mypikpak.com/drive/v1/files:batchTrash", http.MethodPost, func(req *resty.Request) { req.SetBody(map[string]interface{}{"ids": fileIDs}) }, nil)
 	return err
 }
 
 func (d *PikPakClient) BatchDelete(fileIDs []string) error {
-	d.CaptchaToken = ""
 	_, err := d.request("https://api-drive.mypikpak.com/drive/v1/files:batchDelete", http.MethodPost, func(req *resty.Request) { req.SetBody(map[string]interface{}{"ids": fileIDs}) }, nil)
 	return err
 }
 
 func (d *PikPakClient) EmptyTrash() error {
-	d.CaptchaToken = ""
 	_, err := d.request("https://api-drive.mypikpak.com/drive/v1/files/trash:empty", http.MethodPatch, nil, nil)
 	return err
 }
@@ -412,7 +439,24 @@ func (d *PikPakClient) DownloadFileConcurrent(fileID string, fileName string, fi
 	return d.downloadFileConcurrent(fileID, fileName, fileSize, threadNum, progress, downloadOptions{})
 }
 
+func (d *PikPakClient) DownloadFileConcurrentContext(ctx context.Context, fileID, fileName string, fileSize int64, threadNum int, progress func(int64, int64)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.downloadFileConcurrent(fileID, fileName, fileSize, threadNum, progress, downloadOptions{context: ctx})
+}
+
+// DownloadFileResumable retains verified complete chunks across pauses/restarts.
+func (d *PikPakClient) DownloadFileResumable(ctx context.Context, fileID, destination string, size int64, workers int, progress func(int64, int64)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.downloadFileConcurrent(fileID, destination, size, workers, progress, downloadOptions{context: ctx, resume: true})
+}
+
 type downloadOptions struct {
+	resume         bool
+	context        context.Context
 	rangeTransport http.RoundTripper
 	retryWait      func(time.Duration)
 }
@@ -421,6 +465,15 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 	if fileSize <= 0 {
 		return fmt.Errorf("PikPak 文件大小无效: %d", fileSize)
 	}
+	parent := options.context
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	urlStr, err := d.GetDownloadUrl(fileID)
 	if err != nil {
 		return err
@@ -428,8 +481,6 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 	if urlStr == "" {
 		return errors.New("PikPak 未返回文件下载地址")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var linkMu sync.Mutex
 	var linkVersion uint64
 	currentLink := func() (string, uint64) {
@@ -474,15 +525,26 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 		proxyFunc = http.ProxyURL(proxyURL)
 	}
 
-	out, err := os.CreateTemp(filepath.Dir(fileName), "."+filepath.Base(fileName)+".*.part")
-	if err != nil {
-		return err
+	var out *os.File
+	var checkpoint *resumeFile
+	if options.resume {
+		checkpoint, err = openResumeFile(ctx, fileName, d.Username+":"+fileID, fileSize)
+		if err != nil {
+			return err
+		}
+		out = checkpoint.file
+	} else {
+		out, err = os.CreateTemp(filepath.Dir(fileName), "."+filepath.Base(fileName)+".*.part")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(out.Name())
+		if err := out.Truncate(fileSize); err != nil {
+			out.Close()
+			return err
+		}
 	}
-	defer os.Remove(out.Name())
 	defer out.Close()
-	if err := out.Truncate(fileSize); err != nil {
-		return err
-	}
 
 	if threadNum <= 0 {
 		threadNum = 16
@@ -492,7 +554,7 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 	}
 
 	// 1. 切片：固定每块 4MB
-	const BlockSize = 4 * 1024 * 1024
+	const BlockSize = downloadBlockSize
 	totalBlocks := (fileSize + BlockSize - 1) / BlockSize
 	if int64(threadNum) > totalBlocks {
 		threadNum = int(totalBlocks)
@@ -505,7 +567,18 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 	progressChan := make(chan int64, 2000)
 
 	// 初始填装任务
+	pendingBlocks := int64(0)
+	var resumedBytes int64
+	if checkpoint != nil {
+		resumedBytes = checkpoint.completedBytes()
+	}
 	for i := int64(0); i < totalBlocks; i++ {
+		if checkpoint != nil {
+			if _, done := checkpoint.manifest.Completed[i]; done {
+				continue
+			}
+		}
+		pendingBlocks++
 		start := i * BlockSize
 		end := start + BlockSize - 1
 		if end >= fileSize {
@@ -560,6 +633,15 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 					attempts++
 					resp, err := client.Do(req)
 					if err == nil && (resp.StatusCode == 206 || (totalBlocks == 1 && resp.StatusCode == 200)) {
+						if resp.StatusCode == http.StatusPartialContent {
+							var rangeStart, rangeEnd, rangeSize int64
+							_, scanErr := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &rangeStart, &rangeEnd, &rangeSize)
+							if scanErr != nil || rangeStart != job.Start || rangeEnd != job.End || rangeSize != fileSize {
+								resp.Body.Close()
+								lastErr = fmt.Errorf("分块 %d 的 Content-Range 与请求不符", job.Index)
+								break
+							}
+						}
 						// 读取数据
 						buf := make([]byte, 128*1024)
 						var currentOffset = job.Start
@@ -636,6 +718,13 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 				}
 
 				if success {
+					if checkpoint != nil {
+						if err := checkpoint.complete(job.Index); err != nil {
+							results <- err
+							cancel()
+							continue
+						}
+					}
 					results <- nil
 				} else {
 					if attempts > 1 {
@@ -655,7 +744,10 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 	progressDone := make(chan struct{})
 	go func() {
 		defer close(progressDone)
-		var totalDownloaded int64 = 0
+		var totalDownloaded int64 = resumedBytes
+		if progress != nil {
+			progress(totalDownloaded, fileSize)
+		}
 		for n := range progressChan {
 			totalDownloaded += n
 			if progress != nil {
@@ -666,7 +758,7 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 
 	// 5. 等待所有块完成
 	var downloadErr error
-	for i := int64(0); i < totalBlocks; i++ {
+	for i := int64(0); i < pendingBlocks; i++ {
 		if resultErr := <-results; resultErr != nil && downloadErr == nil {
 			downloadErr = resultErr
 		}
@@ -682,7 +774,18 @@ func (d *PikPakClient) downloadFileConcurrent(fileID string, fileName string, fi
 	if err := out.Close(); err != nil {
 		return err
 	}
-	return os.Rename(out.Name(), fileName)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(out.Name(), fileName); err != nil {
+		return err
+	}
+	if checkpoint != nil {
+		// The destination is already complete; failure to remove metadata is harmless.
+		_ = os.Remove(checkpoint.path)
+		_ = os.Remove(checkpoint.path + ".bak")
+	}
+	return nil
 }
 
 // OfflineDownload 添加离线下载任务

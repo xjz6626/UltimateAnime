@@ -328,3 +328,32 @@ func jsonResponse(request *http.Request, body string) *http.Response {
 	header.Set("Content-Type", "application/json")
 	return &http.Response{StatusCode: 200, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: request}
 }
+
+func TestLongEpisodesAndAmbiguousNumbers(t *testing.T) {
+	for title, want := range map[string]float64{
+		"番剧 - 201 [1080P]": 201, "番剧 [500]": 500, "番剧 - 1122 [CHS]": 1122, "番剧 第1080集": 1080,
+		"番剧 [12.5]": 12.5, "番剧 S02E01": 1, "番剧 [201-500]": -1, "番剧 [1080] [2026]": -1, "番剧 [1920x1080]": -1, "番剧 第1122集 2026-10-22": 1122, "番剧 Season 2 [1080P]": -1,
+	} {
+		if got := ParseEpisodeNumber(title); got != want {
+			t.Errorf("%q = %v, want %v", title, got, want)
+		}
+	}
+}
+
+func TestAutomaticSelectionRejectsWrongSeasonAndUnknownIdentity(t *testing.T) {
+	for _, title := range []string{"番剧 S01E01 [CHS]", "番剧 Season 2 S01E01 [CHS]", "其他作品 S02E01 [CHS]", "番剧 - 01 [CHS]"} {
+		c := NewCrawler("https://example.test/resources", "")
+		c.mikanURL = ""
+		c.client.SetTransport(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body, _ := json.Marshal(map[string]any{"resources": []ResourceItem{{Title: title, Magnet: "magnet:test"}}})
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(body))), Request: r}, nil
+		}))
+		manual, err := c.SearchEpisodeList([]string{"番剧 Season 2"}, 1)
+		if err != nil || len(manual) != 1 || manual[0].MatchWarning == "" {
+			t.Fatalf("manual candidates: %+v %v", manual, err)
+		}
+		if automatic, err := c.SearchEpisode([]string{"番剧 Season 2"}, 1); err == nil || automatic != nil {
+			t.Fatalf("unsafe automatic selection: %+v", automatic)
+		}
+	}
+}
